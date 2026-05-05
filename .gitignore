@@ -1,0 +1,12 @@
+*.fasta
+*.csv
+.idea/
+.vscode/
+.venv/
+optimize/*
+!optimize/optimize.py
+!optimize/optimize-nrf.py
+1bench_run/
+2bench_run/
+parabola
+parabola.o
