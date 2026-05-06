@@ -18,7 +18,7 @@ make
 export PATH=$PATH:`pwd`
 
 # Simply measure distance between test1 and test2
-parabola dist benchmark/test1.fasta benchmark/test2
+parabola dist benchmark/test1.fasta benchmark/test2.fasta
 # Reference File      : benchmark/test1.fasta
 # Query File          : benchmark/test2.fasta
 # Shared Hashes       : 4 / 392
@@ -51,7 +51,7 @@ Once installed via Conda, the `parabola` command will be available directly in y
 
 ### Implementation details
 #### Reverb encoding system
-Parabola utilizes a symmetric 3-bit nucleotide encoding system known as Reverb, where the bases A, C, G, and T are encoded as $001_{(2)}$, $110_{(2)}$, $011_{(2)}$, and $100_{(2)}$, respectively.
+Parabola utilizes a symmetric 3-bit nucleotide encoding system, Reverb, where the bases A, C, G, and T are encoded as $001_{(2)}$, $110_{(2)}$, $011_{(2)}$, and $100_{(2)}$, respectively.
 By design, complementary base pairs (A/T and C/G) are bit-reflections of each other.
 This structural symmetry allows Parabola to derive the reverse complement hash instantaneously using a 128-bit reversal operation, bypassing the need for an independent, character-wise traversal of the reverse strand.
 
