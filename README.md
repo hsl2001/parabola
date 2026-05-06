@@ -4,7 +4,7 @@
 ### Getting started
 ```bash
 # Quick installation by pre-compiled binaries
-wget https://github.com/hsl2001/release/~~
+wget https://github.com/hsl2001/parabola/releases/download/1.0/parabola
 chmod a+x parabola
 ./parabola -h
 export PATH=$PATH:`pwd`
