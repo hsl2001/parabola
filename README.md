@@ -19,10 +19,19 @@ export PATH=$PATH:`pwd`
 
 # Simply measure distance between test1 and test2
 parabola dist benchmark/test1.fasta benchmark/test2
+# Reference File      : benchmark/test1.fasta
+# Query File          : benchmark/test2.fasta
+# Shared Hashes       : 4 / 392
+# ------------------------------------
+# Jaccard Index       : 0.010204
+# Parabola Distance   : 0.197915
 
 # Compute lower triangular distance metrix
 parabola triangle benchmark/test1.fasta benchmark/test2.fasta benchmark/test3.fasta
-
+# 3
+# benchmark/test1.fasta
+# benchmark/test2.fasta   0.197915
+# benchmark/test3.fasta   0.180695        0.183343
 ```
 
 ### Background
