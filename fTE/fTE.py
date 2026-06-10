@@ -4,6 +4,8 @@ import glob
 import argparse
 import subprocess
 import shutil
+import collections
+import heapq
 from Bio import SeqIO, Phylo
 from concurrent.futures import ThreadPoolExecutor
 
@@ -161,80 +163,181 @@ def run_parabola(fasta_files, work_dir, id_map, filter_pct, k=21, scale=1000, th
         
     num_kept = len(keep_indices)
     phylip_lines = [str(num_kept)]
+    dist_dict = {}
     for i in keep_indices:
         row = f"{taxa_names[i]} " + " ".join(f"{dists[i][j]:.6f}" for j in keep_indices)
         phylip_lines.append(row)
         
+        dist_dict[taxa_names[i]] = {}
+        for j in keep_indices:
+            dist_dict[taxa_names[i]][taxa_names[j]] = dists[i][j]
+            
     matrix_file = os.path.join(work_dir, "distance_matrix.phy")
     with open(matrix_file, "w") as f:
         f.write('\n'.join(phylip_lines) + '\n')
         
-    return matrix_file, [fasta_files[i] for i in keep_indices]
+    return matrix_file, [fasta_files[i] for i in keep_indices], dist_dict
 
 
 
-def find_founder_candidates(tree_file, id_map, dist_threshold=0.5):
-    """FastME 트리 파싱: 임계값 기준으로 클레이드(TE 패밀리) 분리 및 중심 서열(Founder 후보) 추출"""
-    print(f"[*] Parsing FastME tree to identify Founder Candidates (threshold={dist_threshold})...")
-    tree = Phylo.read(tree_file, "newick")
-    print("    -> Applying midpoint rooting...")
-    tree.root_at_midpoint()
+def calc_silhouette_score(clusters, dist_dict):
+    valid_clusters = [c for c in clusters if c]
+    if len(valid_clusters) < 2: return -1.0
+
+    total_s = 0.0
+    num_leaves = sum(len(c) for c in valid_clusters)
     
-    # 각 노드에서 하위 말단 노드(leaf)들까지의 거리 계산 헬퍼 함수
-    def get_leaf_distances(node):
-        dists = []
-        def _dfs(curr, current_dist):
-            if curr.is_terminal():
-                dists.append((curr, current_dist))
+    for cidx, comp in enumerate(valid_clusters):
+        for leaf in comp:
+            if len(comp) == 1:
+                total_s += 0.0
             else:
-                for child in curr.clades:
-                    _dfs(child, current_dist + (child.branch_length or 0.0))
-        _dfs(node, 0.0)
-        return dists
-
-    valid_clades = []
-    
-    def traverse(node):
-        if node.is_terminal():
-            return
-            
-        leaf_dists = get_leaf_distances(node)
-        if len(leaf_dists) < 3:
-            return
-            
-        max_dist = max(d for leaf, d in leaf_dists)
-        
-        if max_dist <= dist_threshold:
-            valid_clades.append((node, leaf_dists))
-        else:
-            for child in node.clades:
-                traverse(child)
+                a_i = sum(dist_dict[leaf][other] for other in comp if other != leaf) / (len(comp) - 1)
+                b_i = min((sum(dist_dict[leaf][other] for other in other_comp) / len(other_comp) 
+                           for other_cidx, other_comp in enumerate(valid_clusters) if cidx != other_cidx), default=float('inf'))
                 
+                max_val = max(a_i, b_i)
+                total_s += (b_i - a_i) / max_val if max_val > 0 else 0.0
+                
+    return total_s / num_leaves if num_leaves > 0 else -1.0
+
+
+def get_connected_components(nodes, edges, return_weighted_adj=False):
+    adj = collections.defaultdict(list)
+    for u, v, w in edges:
+        adj[u].append((v, w) if return_weighted_adj else v)
+        adj[v].append((u, w) if return_weighted_adj else u)
+        
+    visited = set()
+    components = []
+    for node in nodes:
+        if node not in visited:
+            comp = set()
+            q = collections.deque([node])
+            visited.add(node)
+            while q:
+                curr = q.popleft()
+                comp.add(curr)
+                for neighbor in adj[curr]:
+                    n_node = neighbor[0] if return_weighted_adj else neighbor
+                    if n_node not in visited:
+                        visited.add(n_node)
+                        q.append(n_node)
+            components.append(comp)
+    return components, adj
+
+
+def find_founder_candidates(tree_file, id_map, dist_dict, k_clusters="auto", max_k=20):
+    """FastME 트리 파싱: 최장 거리 간선들을 제거하여 K개의 클러스터로 분리 및 중심 서열 추출"""
+    print(f"[*] Parsing FastME tree for K-clusters cut...")
+    tree = Phylo.read(tree_file, "newick")
+    
+    edges = []
+    def traverse(node):
+        for child in node.clades:
+            edges.append((node, child, max(0.0, child.branch_length or 0.0)))
+            traverse(child)
     traverse(tree.root)
     
-    candidates = []
-    for idx, (clade, leaf_dists) in enumerate(valid_clades):
-        best_leaf = None
-        min_dist = float('inf')
+    all_nodes = set()
+    for u, v, w in edges:
+        all_nodes.update([u, v])
+    if not all_nodes: all_nodes.add(tree.root)
         
-        # 클레이드 조상으로부터 가장 거리가 짧은(min_dist) leaf 찾기
-        for leaf, dist in leaf_dists:
-            if dist < min_dist:
-                min_dist = dist
-                best_leaf = leaf
+    leaves_count = sum(1 for n in all_nodes if n.name and n.is_terminal())
+    sorted_edges = sorted(edges, key=lambda x: x[2], reverse=True)
+    
+    def evaluate_k(k):
+        keep_edges = sorted_edges[k-1:] if k > 1 else sorted_edges
+        comps, _ = get_connected_components(all_nodes, keep_edges)
+        return [[n.name for n in c if n.name and n.is_terminal()] for c in comps]
+
+    if str(k_clusters).lower() == "auto":
+        print(f"    -> Finding optimal K using Silhouette Score (testing K=2 to {max_k})...")
+        best_k, best_score = 1, -float('inf')
+        max_k = min(max_k, leaves_count - 1)
+        
+        for k in range(2, max_k + 1):
+            score = calc_silhouette_score(evaluate_k(k), dist_dict)
+            print(f"       [K={k}] Silhouette Score: {score:.4f}")
+            if score > best_score:
+                best_score, best_k = score, k
                 
+        if best_k == 1: print("    -> Not enough leaves to cluster. Defaulting to K=1")
+        else: print(f"    => Optimal K selected: {best_k} (Score: {best_score:.4f})")
+    else:
+        try:
+            best_k = int(k_clusters)
+            print(f"    -> Using specified K={best_k}")
+        except ValueError:
+            print("[Error] Invalid k_clusters value.")
+            sys.exit(1)
+            
+    # 최적 K 결정 이후 진짜 외군(Basal leaf) 탐색
+    keep_edges = sorted_edges[best_k-1:] if best_k > 1 else sorted_edges
+    cut_edges = sorted_edges[:best_k-1] if best_k > 1 else []
+    components, adj_weighted = get_connected_components(all_nodes, keep_edges, return_weighted_adj=True)
+            
+    candidates = []
+    for idx, comp_nodes in enumerate(components):
+        comp_leaves = [n for n in comp_nodes if n.name and n.is_terminal()]
+        if not comp_leaves: continue
+            
+        cut_nodes = []
+        for u, v, w in cut_edges:
+            if u in comp_nodes and v not in comp_nodes: cut_nodes.append(u)
+            elif v in comp_nodes and u not in comp_nodes: cut_nodes.append(v)
+                
+        best_leaf = None
+        if not cut_nodes:
+            # K=1 이거나 외부 연결점이 없는 경우 중심점(Medoid) 사용
+            leaf_names = [n.name for n in comp_leaves]
+            best_leaf = min(leaf_names, key=lambda l: 0 if len(leaf_names) == 1 else sum(dist_dict[l][o] for o in leaf_names if o != l) / (len(leaf_names)-1))
+        else:
+            # 외부(cut edge)와 연결된 노드들부터 시작하여 BFS/Dijkstra
+            pq = [(0, 0.0, id(cn), cn) for cn in cut_nodes]
+            shortest_paths = {}
+            while pq:
+                tdist, bdist, _, curr = heapq.heappop(pq)
+                if curr in shortest_paths: continue
+                shortest_paths[curr] = (tdist, bdist)
+                
+                for neighbor, w in adj_weighted[curr]:
+                    if neighbor not in shortest_paths:
+                        heapq.heappush(pq, (tdist + 1, bdist + w, id(neighbor), neighbor))
+                        
+            best_leaf_node = min(comp_leaves, key=lambda n: shortest_paths.get(n, (float('inf'), float('inf'))))
+            best_leaf = best_leaf_node.name
+
         if best_leaf:
-            short_id = os.path.basename(best_leaf.name).split('.')[0]
+            short_id = best_leaf.split('.')[0]
             candidates.append({
-                "clade_id": f"Clade_{idx+1}",
+                "clade_id": f"Cluster_{idx+1}",
                 "founder_short_id": short_id,
                 "founder_real_id": id_map.get(short_id, short_id),
-                "cluster_leaves": [leaf.name for leaf, d in leaf_dists],
-                "cluster_size": len(leaf_dists)
+                "cluster_size": len(comp_leaves)
             })
             
-    # 클러스터 크기 순 정렬 후 반환
     return sorted(candidates, key=lambda x: x['cluster_size'], reverse=True)
+
+
+def save_regions_to_bed(item_list, id_map, results_dir, suffix):
+    """주어진 리스트를 기반으로 파싱하여 BED 파일 생성"""
+    genome_beds = collections.defaultdict(list)
+    for item in item_list:
+        short_id = os.path.basename(item).split('.')[0]
+        real_id = id_map.get(short_id)
+        if real_id and '|' in real_id:
+            genome_id, chrom, coords = real_id.split('|')
+            start, end = coords.split('-')
+            genome_beds[genome_id].append((chrom, int(start), int(end), short_id))
+            
+    for genome_id, regions in genome_beds.items():
+        bed_file = os.path.join(results_dir, f"{genome_id}_{suffix}.bed")
+        print(f"[*] Saving BED file: {bed_file}")
+        with open(bed_file, "w") as f:
+            for chrom, start, end, name in sorted(regions, key=lambda x: (x[0], x[1])):
+                f.write(f"{chrom}\t{start}\t{end}\t{name}\n")
 
 
 
@@ -245,9 +348,10 @@ def main():
     parser.add_argument("-k", "--kmer", type=int, default=21, help="K-mer size for Parabola")
     parser.add_argument("-c", "--scale", type=int, default=1000, help="FracMinHash scale for Parabola")
     parser.add_argument("-p", "--threads", type=int, default=16, help="Number of threads")
-    parser.add_argument("-f", "--filter_pct", type=float, default=0.5, help="Genome coverage filter threshold in percent (default: 1.0 for 1 percent)")
-    parser.add_argument("-t", "--threshold", type=float, default=0.5, help="Distance threshold for TE clade clustering (default: 0.5)")
-    parser.add_argument("-x", "--complexity", type=float, default=0.9, help="K-mer complexity threshold to drop tandem repeats (default: 0.5)")
+    parser.add_argument("-f", "--filter_pct", type=float, default=0.5, help="Genome coverage filter threshold in percent (default: 0.5)")
+    parser.add_argument("-k_cls", "--k_clusters", type=str, default="auto", help="Number of clusters to cut the tree into, or 'auto' to find optimal K (default: auto)")
+    parser.add_argument("-max_k", "--max_k", type=int, default=20, help="Maximum K to test when k_clusters is 'auto' (default: 20)")
+    parser.add_argument("-x", "--complexity", type=float, default=0.5, help="K-mer complexity threshold to drop tandem repeats (default: 0.5)")
     args = parser.parse_args()
 
     input_name = os.path.basename(args.input_dir.rstrip('/'))
@@ -260,7 +364,7 @@ def main():
     chunk_files, id_map = generate_non_overlapping_windows(args.input_dir, work_dir, args.window, args.threads, args.complexity)
     
     # 2. Parabola 실행 (Sketch & Triangle)
-    matrix_file, kept_files = run_parabola(chunk_files, work_dir, id_map, args.filter_pct, args.kmer, args.scale, args.threads)
+    matrix_file, kept_files, dist_dict = run_parabola(chunk_files, work_dir, id_map, args.filter_pct, args.kmer, args.scale, args.threads)
     
     # 3. FastME 계통수 구축
     print("[*] Building phylogenetic tree with FastME...")
@@ -268,7 +372,7 @@ def main():
     run_cmd(["fastme", "-i", matrix_file, "-o", tree_file, "-T", "16", "-s"])
     
     # 4. 트리 파싱 및 후보 클러스터 추출
-    candidates = find_founder_candidates(tree_file, id_map, dist_threshold=args.threshold)
+    candidates = find_founder_candidates(tree_file, id_map, dist_dict, k_clusters=args.k_clusters, max_k=args.max_k)
     
     print("\n[+] Top TE Clades Detected:")
     for c in candidates:
@@ -281,50 +385,10 @@ def main():
     os.makedirs(results_dir, exist_ok=True)
 
     # 6.1 최종 TE candidate의 위치를 <genome>_fTE.bed 파일로 작성
-    genome_beds = {}
-    for c in candidates:
-        short_id = c['founder_short_id']
-        real_id = id_map.get(short_id)
-        if real_id and '|' in real_id:
-            parts = real_id.split('|')
-            genome_id = parts[0]
-            chrom = parts[1]
-            coords = parts[2]
-            start, end = coords.split('-')
-            
-            if genome_id not in genome_beds:
-                genome_beds[genome_id] = []
-            genome_beds[genome_id].append((chrom, start, end, short_id))
-            
-    for genome_id, regions in genome_beds.items():
-        bed_file = os.path.join(results_dir, f"{genome_id}_fTE.bed")
-        print(f"[*] Saving BED file: {bed_file}")
-        with open(bed_file, "w") as f:
-            for chrom, start, end, name in regions:
-                f.write(f"{chrom}\t{start}\t{end}\t{name}\n")
+    save_regions_to_bed([c['founder_short_id'] for c in candidates], id_map, results_dir, "fTE")
 
     # 6.2 살아남은 window의 위치를 <genome>_window.bed 파일로 작성
-    genome_windows = {}
-    for path in kept_files:
-        short_id = os.path.basename(path).split('.')[0]
-        real_id = id_map.get(short_id)
-        if real_id and '|' in real_id:
-            parts = real_id.split('|')
-            genome_id = parts[0]
-            chrom = parts[1]
-            coords = parts[2]
-            start, end = coords.split('-')
-            
-            if genome_id not in genome_windows:
-                genome_windows[genome_id] = []
-            genome_windows[genome_id].append((chrom, start, end, short_id))
-            
-    for genome_id, regions in genome_windows.items():
-        bed_file = os.path.join(results_dir, f"{genome_id}_window.bed")
-        print(f"[*] Saving BED file: {bed_file}")
-        with open(bed_file, "w") as f:
-            for chrom, start, end, name in sorted(regions, key=lambda x: (x[0], int(x[1]))):
-                f.write(f"{chrom}\t{start}\t{end}\t{name}\n")
+    save_regions_to_bed(kept_files, id_map, results_dir, "window")
 
     final_tree_file = os.path.join(results_dir, f"{input_name}_tree.nwk")
     if os.path.exists(tree_file):
