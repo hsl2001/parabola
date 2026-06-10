@@ -55,12 +55,12 @@ def run_parabola(fasta_files, work_dir, k=21, scale=1000, threads=8):
     print(f"[*] Running Parabola (k={k}, s={scale}, threads={threads})...")
     
     # 1. Parabola Sketch
-    cmd_sketch = ["parabola", "sketch", "-k", str(k), "-s", str(scale), "-p", str(threads)] + fasta_files
+    cmd_sketch = ["./parabola", "sketch", "-k", str(k), "-s", str(scale), "-p", str(threads)] + fasta_files
     run_cmd(cmd_sketch)
     
     # 2. Parabola Triangle
     sketch_files = [f + ".parabola" for f in fasta_files]
-    cmd_triangle = ["parabola", "triangle"] + sketch_files
+    cmd_triangle = ["./parabola", "triangle"] + sketch_files
     matrix_out = run_cmd(cmd_triangle, capture_out=True)
     
     # 결과 행렬 저장
