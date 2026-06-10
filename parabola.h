@@ -2,6 +2,7 @@
 #define PARABOLA_H
 
 #include <stdint.h>
+#include <stddef.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -49,6 +50,9 @@ typedef struct {
 
 typedef struct {
   double distance;
+  double distance_jc;
+  double distance_naive;
+  double distance_naive_jc;
   double jaccard;
   size_t shared_hashes;
   size_t total_hashes;

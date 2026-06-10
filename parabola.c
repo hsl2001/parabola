@@ -315,11 +315,10 @@ static void pair_update(PairInfo *acc, int inA, int inB, uint32_t sA,
 
 static ParabolaDistResult finalize_pair(const PairInfo *acc, uint32_t kmer_size,
                                         int use_jc) {
-  ParabolaDistResult res = {1.0, 0.0, acc->inter, acc->uni};
+  ParabolaDistResult res = {1.0, 1.0, 1.0, 1.0, 0.0, acc->inter, acc->uni};
 
   if (acc->uni == 0 || acc->inter == 0) {
     res.jaccard = 0.0;
-    res.distance = 1.0;
     return res;
   }
 
@@ -362,25 +361,40 @@ static ParabolaDistResult finalize_pair(const PairInfo *acc, uint32_t kmer_size,
   double alpha = 1.0 - x;
   double d = d_naive - (1.0 / k) * log(alpha);
 
-  if (!use_jc) {
-    res.distance = d;
+  double d_jc, d_naive_jc;
+
+  if (d >= 0.75) {
+    d_jc = 1.0;
   } else {
-    if (d >= 0.75) {
-      res.distance = 1.0;
-    } else {
-      res.distance = -0.75 * log(1.0 - (4.0 / 3.0) * d);
-    }
+    d_jc = -0.75 * log(1.0 - (4.0 / 3.0) * d);
   }
 
-  if (res.distance < 0.0) res.distance = 0.0;
-  if (res.distance > 1.0) res.distance = 1.0;
+  if (d_naive >= 0.75) {
+    d_naive_jc = 1.0;
+  } else {
+    d_naive_jc = -0.75 * log(1.0 - (4.0 / 3.0) * d_naive);
+  }
+
+  if (d < 0.0) d = 0.0;
+  if (d > 1.0) d = 1.0;
+  if (d_jc < 0.0) d_jc = 0.0;
+  if (d_jc > 1.0) d_jc = 1.0;
+  if (d_naive < 0.0) d_naive = 0.0;
+  if (d_naive > 1.0) d_naive = 1.0;
+  if (d_naive_jc < 0.0) d_naive_jc = 0.0;
+  if (d_naive_jc > 1.0) d_naive_jc = 1.0;
+
+  res.distance = d;
+  res.distance_jc = d_jc;
+  res.distance_naive = d_naive;
+  res.distance_naive_jc = d_naive_jc;
 
   return res;
 }
 
 ParabolaDistResult parabola_dist(const ParabolaSketch *ref,
                                  const ParabolaSketch *query, int use_jc) {
-  ParabolaDistResult res = {1.0, 0.0, 0, 0};
+  ParabolaDistResult res = {1.0, 1.0, 1.0, 1.0, 0.0, 0, 0};
   if (ref->kmer_size == 0 || query->kmer_size != ref->kmer_size)
     return res;
 
@@ -414,7 +428,7 @@ ParabolaTripleDistResult parabola_dist_three(const ParabolaSketch *ref,
 
   if (ref->kmer_size == 0 || q1->kmer_size != ref->kmer_size ||
       q2->kmer_size != ref->kmer_size) {
-    t.d01 = t.d02 = t.d12 = (ParabolaDistResult){1.0, 0.0, 0, 0};
+    t.d01 = t.d02 = t.d12 = (ParabolaDistResult){1.0, 1.0, 1.0, 1.0, 0.0, 0, 0};
     return t;
   }
 
@@ -674,7 +688,8 @@ static void free_ready_sketches(ParabolaSketch *sketches, const int *ready,
 
 static void print_distance_report(const ParabolaSketch *ref,
                                   const ParabolaSketch *query,
-                                  const ParabolaDistResult *dist) {
+                                  const ParabolaDistResult *dist,
+                                  int use_jc) {
   printf("Reference File      : %s\n", ref->name);
   printf("Query File          : %s\n", query->name);
   printf("Shared Hashes       : %zu / %zu\n", dist->shared_hashes,
@@ -682,6 +697,13 @@ static void print_distance_report(const ParabolaSketch *ref,
   printf("------------------------------------\n");
   printf("Jaccard Index       : %f\n", dist->jaccard);
   printf("Parabola Distance   : %f\n", dist->distance);
+  if (use_jc) {
+    printf("Parabola Dist. (JC) : %f\n", dist->distance_jc);
+  }
+  printf("Naive Distance      : %f\n", dist->distance_naive);
+  if (use_jc) {
+    printf("Naive Dist. (JC)    : %f\n", dist->distance_naive_jc);
+  }
 }
 
 static void print_usage(void) {
@@ -854,7 +876,7 @@ int cmd_dist(int argc, char **argv) {
     return 1;
 
   ParabolaDistResult dist = parabola_dist(&sk[0], &sk[1], use_jc);
-  print_distance_report(&sk[0], &sk[1], &dist);
+  print_distance_report(&sk[0], &sk[1], &dist, use_jc);
 
   free_ready_sketches(sk, ready, 2);
   free(sk);
@@ -872,11 +894,11 @@ int cmd_three(int argc, char **argv) {
 
   ParabolaTripleDistResult tri =
       parabola_dist_three(&sk[0], &sk[1], &sk[2], use_jc);
-  print_distance_report(&sk[0], &sk[1], &tri.d01);
+  print_distance_report(&sk[0], &sk[1], &tri.d01, use_jc);
   printf("\n");
-  print_distance_report(&sk[0], &sk[2], &tri.d02);
+  print_distance_report(&sk[0], &sk[2], &tri.d02, use_jc);
   printf("\n");
-  print_distance_report(&sk[1], &sk[2], &tri.d12);
+  print_distance_report(&sk[1], &sk[2], &tri.d12, use_jc);
 
   free_ready_sketches(sk, ready, 3);
   free(sk);
@@ -897,7 +919,12 @@ int cmd_triangle(int argc, char **argv) {
   for (int i = 0; i < n; i++) {
     printf("%s", sk[i].name ? sk[i].name : "N/A");
     for (int j = 0; j < i; j++) {
-      printf("\t%f", parabola_dist(&sk[i], &sk[j], use_jc).distance);
+      ParabolaDistResult d = parabola_dist(&sk[i], &sk[j], use_jc);
+      if (use_jc) {
+        printf("\t%f,%f,%f,%f", d.distance, d.distance_jc, d.distance_naive, d.distance_naive_jc);
+      } else {
+        printf("\t%f,%f", d.distance, d.distance_naive);
+      }
     }
     printf("\n");
   }
