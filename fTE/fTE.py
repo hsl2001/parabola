@@ -5,6 +5,7 @@ import argparse
 import subprocess
 import shutil
 from Bio import SeqIO, Phylo
+from concurrent.futures import ThreadPoolExecutor
 
 def run_cmd(cmd_list, capture_out=False):
     """명령어 실행 및 결과 캡처 헬퍼 함수"""
@@ -14,8 +15,41 @@ def run_cmd(cmd_list, capture_out=False):
         sys.exit(1)
     return result.stdout if capture_out else None
 
-def generate_non_overlapping_windows(input_dir, work_dir, window_size=10000):
-    """오버랩 없이 유전체를 분할하여 개별 FASTA 파일로 저장"""
+def stream_windows(fasta_path, window_size):
+    with open(fasta_path, 'r') as f:
+        current_chrom = None
+        buffer = []
+        buffer_len = 0
+        chrom_pos = 0
+        
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            if line.startswith('>'):
+                current_chrom = line[1:].split()[0]
+                buffer = []
+                buffer_len = 0
+                chrom_pos = 0
+            else:
+                buffer.append(line)
+                buffer_len += len(line)
+                while buffer_len >= window_size:
+                    full_str = "".join(buffer)
+                    window_seq = full_str[:window_size]
+                    yield current_chrom, chrom_pos, window_seq
+                    
+                    rest = full_str[window_size:]
+                    buffer = [rest]
+                    buffer_len = len(rest)
+                    chrom_pos += window_size
+
+def write_chunk(chunk_file, short_id, seq):
+    with open(chunk_file, "w") as f:
+        f.write(f">{short_id}\n{seq}\n")
+
+def generate_non_overlapping_windows(input_dir, work_dir, window_size=10000, threads=8):
+    """오버랩 없이 유전체를 분할하여 개별 FASTA 파일로 저장 (고성능/저메모리 버전)"""
     print(f"[*] Generating {window_size}bp non-overlapping windows...")
     fasta_files = glob.glob(os.path.join(input_dir, "*.fa*"))
     
@@ -26,26 +60,24 @@ def generate_non_overlapping_windows(input_dir, work_dir, window_size=10000):
     chunk_files = []
     window_counter = 0
     
-    for fasta in fasta_files:
-        genome_id = os.path.basename(fasta).split('.')[0]
-        for record in SeqIO.parse(fasta, "fasta"):
-            seq_len = len(record.seq)
-            
-            # 오버랩 없이(window_size 간격으로) 분할
-            for start in range(0, seq_len - window_size + 1, window_size):
-                end = start + window_size
-                window_seq = record.seq[start:end]
-                
+    with ThreadPoolExecutor(max_workers=threads) as executor:
+        futures = []
+        for fasta in fasta_files:
+            genome_id = os.path.basename(fasta).split('.')[0]
+            for chrom, start, seq in stream_windows(fasta, window_size):
                 window_counter += 1
                 short_id = f"W{window_counter:05d}"
-                real_id = f"{genome_id}|{record.id}|{start}-{end}"
+                real_id = f"{genome_id}|{chrom}|{start}-{start + window_size}"
                 
                 chunk_file = os.path.join(chunks_dir, f"{short_id}.fasta")
-                with open(chunk_file, "w") as f:
-                    f.write(f">{short_id}\n{window_seq}\n")
-                
                 id_map[short_id] = real_id
                 chunk_files.append(chunk_file)
+                
+                futures.append(executor.submit(write_chunk, chunk_file, short_id, seq))
+                
+        # Wait for all file writes to complete
+        for future in futures:
+            future.result()
                 
     print(f"    -> Total {window_counter} windows generated.")
     return chunk_files, id_map
@@ -54,9 +86,12 @@ def run_parabola(fasta_files, work_dir, id_map, filter_pct, k=21, scale=1000, th
     """Parabola sketch 및 triangle을 이용한 거리 행렬 계산"""
     print(f"[*] Running Parabola (k={k}, s={scale}, threads={threads})...")
     
-    # 1. Parabola Sketch
-    cmd_sketch = ["./parabola", "sketch", "-k", str(k), "-s", str(scale), "-p", str(threads)] + fasta_files
-    run_cmd(cmd_sketch)
+    # 1. Parabola Sketch (배칭 처리하여 인자 제한 우회)
+    batch_size = 5000
+    for i in range(0, len(fasta_files), batch_size):
+        batch = fasta_files[i:i+batch_size]
+        cmd_sketch = ["./parabola", "sketch", "-k", str(k), "-s", str(scale), "-p", str(threads)] + batch
+        run_cmd(cmd_sketch)
     
     # 2. Parabola Triangle
     sketch_files = [f + ".parabola" for f in fasta_files]
@@ -249,16 +284,20 @@ def main():
     parser.add_argument("-w", "--window", type=int, default=10000, help="Non-overlapping window size (bp)")
     parser.add_argument("-k", "--kmer", type=int, default=21, help="K-mer size for Parabola")
     parser.add_argument("-c", "--scale", type=int, default=1000, help="FracMinHash scale for Parabola")
-    parser.add_argument("-p", "--threads", type=int, default=8, help="Number of threads")
+    parser.add_argument("-p", "--threads", type=int, default=16, help="Number of threads")
     parser.add_argument("-t", "--trim", type=int, default=100, help="Trimming step size for carving (bp)")
     parser.add_argument("-f", "--filter_pct", type=float, default=1.0, help="Genome coverage filter threshold in percent (default: 1.0 for 1 percent)")
     args = parser.parse_args()
 
-    work_dir = "te_workspace"
+    input_name = os.path.basename(args.input_dir.rstrip('/'))
+    work_dir = f"te_workspace_{input_name}"
+    # 이전 불완전한 런의 찌꺼기를 제거하기 위해 시작 시 기존 워크스페이스 디렉토리 삭제 후 생성
+    if os.path.exists(work_dir):
+        shutil.rmtree(work_dir)
     os.makedirs(work_dir, exist_ok=True)
     
     # 1. 오버랩 없는 윈도우 청크 생성
-    chunk_files, id_map = generate_non_overlapping_windows(args.input_dir, work_dir, args.window)
+    chunk_files, id_map = generate_non_overlapping_windows(args.input_dir, work_dir, args.window, args.threads)
     
     # 2. Parabola 실행 (Sketch & Triangle)
     matrix_file, kept_files = run_parabola(chunk_files, work_dir, id_map, args.filter_pct, args.kmer, args.scale, args.threads)
@@ -300,14 +339,14 @@ def main():
             
             if genome_id not in genome_beds:
                 genome_beds[genome_id] = []
-            genome_beds[genome_id].append((chrom, start, end))
+            genome_beds[genome_id].append((chrom, start, end, short_id))
             
     for genome_id, regions in genome_beds.items():
         bed_file = os.path.join(results_dir, f"{genome_id}_fTE.bed")
         print(f"[*] Saving BED file: {bed_file}")
         with open(bed_file, "w") as f:
-            for chrom, start, end in regions:
-                f.write(f"{chrom}\t{start}\t{end}\n")
+            for chrom, start, end, name in regions:
+                f.write(f"{chrom}\t{start}\t{end}\t{name}\n")
 
     # 6.2 살아남은 window의 위치를 <genome>_window.bed 파일로 작성
     genome_windows = {}
@@ -323,21 +362,21 @@ def main():
             
             if genome_id not in genome_windows:
                 genome_windows[genome_id] = []
-            genome_windows[genome_id].append((chrom, start, end))
+            genome_windows[genome_id].append((chrom, start, end, short_id))
             
     for genome_id, regions in genome_windows.items():
         bed_file = os.path.join(results_dir, f"{genome_id}_window.bed")
         print(f"[*] Saving BED file: {bed_file}")
         with open(bed_file, "w") as f:
-            for chrom, start, end in sorted(regions, key=lambda x: (x[0], int(x[1]))):
-                f.write(f"{chrom}\t{start}\t{end}\n")
+            for chrom, start, end, name in sorted(regions, key=lambda x: (x[0], int(x[1]))):
+                f.write(f"{chrom}\t{start}\t{end}\t{name}\n")
 
-    # 7. te_workspace 제거, tree.nwk 복사 및 nwk 내의 te_workspace/chunks/ 경로 제거
     final_tree_file = os.path.join(results_dir, "tree.nwk")
     if os.path.exists(tree_file):
         with open(tree_file, "r") as f:
             tree_content = f.read()
-        tree_content = tree_content.replace("te_workspace/chunks/", "")
+        tree_content = tree_content.replace(f"{work_dir}/chunks/", "")
+        tree_content = tree_content.replace(".fasta", "")
         with open(tree_file, "w") as f:
             f.write(tree_content)
         shutil.move(tree_file, final_tree_file)
