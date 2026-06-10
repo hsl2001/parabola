@@ -245,14 +245,13 @@ def main():
     parser.add_argument("-k", "--kmer", type=int, default=21, help="K-mer size for Parabola")
     parser.add_argument("-c", "--scale", type=int, default=1000, help="FracMinHash scale for Parabola")
     parser.add_argument("-p", "--threads", type=int, default=16, help="Number of threads")
-    parser.add_argument("-f", "--filter_pct", type=float, default=1.0, help="Genome coverage filter threshold in percent (default: 1.0 for 1 percent)")
+    parser.add_argument("-f", "--filter_pct", type=float, default=0.5, help="Genome coverage filter threshold in percent (default: 1.0 for 1 percent)")
     parser.add_argument("-t", "--threshold", type=float, default=0.5, help="Distance threshold for TE clade clustering (default: 0.5)")
-    parser.add_argument("-x", "--complexity", type=float, default=0.5, help="K-mer complexity threshold to drop tandem repeats (default: 0.5)")
+    parser.add_argument("-x", "--complexity", type=float, default=0.9, help="K-mer complexity threshold to drop tandem repeats (default: 0.5)")
     args = parser.parse_args()
 
     input_name = os.path.basename(args.input_dir.rstrip('/'))
     work_dir = f"te_workspace_{input_name}"
-    # 이전 불완전한 런의 찌꺼기를 제거하기 위해 시작 시 기존 워크스페이스 디렉토리 삭제 후 생성
     if os.path.exists(work_dir):
         shutil.rmtree(work_dir)
     os.makedirs(work_dir, exist_ok=True)
