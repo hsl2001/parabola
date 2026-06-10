@@ -48,9 +48,9 @@ def write_chunk(chunk_file, short_id, seq):
     with open(chunk_file, "w") as f:
         f.write(f">{short_id}\n{seq}\n")
 
-def generate_non_overlapping_windows(input_dir, work_dir, window_size=10000, threads=8):
+def generate_non_overlapping_windows(input_dir, work_dir, window_size=10000, threads=8, complexity_threshold=0.5):
     """오버랩 없이 유전체를 분할하여 개별 FASTA 파일로 저장 (고성능/저메모리 버전)"""
-    print(f"[*] Generating {window_size}bp non-overlapping windows...")
+    print(f"[*] Generating {window_size}bp non-overlapping windows (complexity >= {complexity_threshold})...")
     fasta_files = glob.glob(os.path.join(input_dir, "*.fa*"))
     
     chunks_dir = os.path.join(work_dir, "chunks")
@@ -59,6 +59,12 @@ def generate_non_overlapping_windows(input_dir, work_dir, window_size=10000, thr
     id_map = {}
     chunk_files = []
     window_counter = 0
+    filtered_counter = 0
+    
+    def get_complexity(seq, k=15):
+        if len(seq) < k: return 0.0
+        kmers = set(seq[i:i+k] for i in range(len(seq)-k+1))
+        return len(kmers) / (len(seq) - k + 1)
     
     with ThreadPoolExecutor(max_workers=threads) as executor:
         futures = []
@@ -66,6 +72,12 @@ def generate_non_overlapping_windows(input_dir, work_dir, window_size=10000, thr
             genome_id = os.path.basename(fasta).split('.')[0]
             for chrom, start, seq in stream_windows(fasta, window_size):
                 window_counter += 1
+                
+                comp = get_complexity(seq)
+                if comp < complexity_threshold:
+                    filtered_counter += 1
+                    continue
+                
                 short_id = f"W{window_counter:05d}"
                 real_id = f"{genome_id}|{chrom}|{start}-{start + window_size}"
                 
@@ -79,7 +91,8 @@ def generate_non_overlapping_windows(input_dir, work_dir, window_size=10000, thr
         for future in futures:
             future.result()
                 
-    print(f"    -> Total {window_counter} windows generated.")
+    print(f"    -> Total {window_counter} windows scanned, {filtered_counter} TR windows dropped.")
+    print(f"    -> {len(chunk_files)} valid windows generated.")
     return chunk_files, id_map
 
 def run_parabola(fasta_files, work_dir, id_map, filter_pct, k=21, scale=1000, threads=8):
@@ -160,24 +173,52 @@ def run_parabola(fasta_files, work_dir, id_map, filter_pct, k=21, scale=1000, th
 
 
 
-def find_founder_candidates(tree_file, id_map):
-    """FastME 트리 파싱: 주요 클레이드(TE 패밀리) 및 중심 서열(Founder 후보) 추출"""
-    print("[*] Parsing FastME tree to identify Founder Candidates...")
+def find_founder_candidates(tree_file, id_map, dist_threshold=0.5):
+    """FastME 트리 파싱: 임계값 기준으로 클레이드(TE 패밀리) 분리 및 중심 서열(Founder 후보) 추출"""
+    print(f"[*] Parsing FastME tree to identify Founder Candidates (threshold={dist_threshold})...")
     tree = Phylo.read(tree_file, "newick")
-    candidates = []
+    print("    -> Applying midpoint rooting...")
+    tree.root_at_midpoint()
     
-    major_clades = tree.root.clades
-    for idx, clade in enumerate(major_clades):
-        if clade.is_terminal(): continue
+    # 각 노드에서 하위 말단 노드(leaf)들까지의 거리 계산 헬퍼 함수
+    def get_leaf_distances(node):
+        dists = []
+        def _dfs(curr, current_dist):
+            if curr.is_terminal():
+                dists.append((curr, current_dist))
+            else:
+                for child in curr.clades:
+                    _dfs(child, current_dist + (child.branch_length or 0.0))
+        _dfs(node, 0.0)
+        return dists
+
+    valid_clades = []
+    
+    def traverse(node):
+        if node.is_terminal():
+            return
             
-        leaves = clade.get_terminals()
-        if len(leaves) < 3: continue # 너무 작은 클러스터는 무시
+        leaf_dists = get_leaf_distances(node)
+        if len(leaf_dists) < 3:
+            return
+            
+        max_dist = max(d for leaf, d in leaf_dists)
         
+        if max_dist <= dist_threshold:
+            valid_clades.append((node, leaf_dists))
+        else:
+            for child in node.clades:
+                traverse(child)
+                
+    traverse(tree.root)
+    
+    candidates = []
+    for idx, (clade, leaf_dists) in enumerate(valid_clades):
         best_leaf = None
         min_dist = float('inf')
         
-        for leaf in leaves:
-            dist = tree.distance(clade, leaf)
+        # 클레이드 조상으로부터 가장 거리가 짧은(min_dist) leaf 찾기
+        for leaf, dist in leaf_dists:
             if dist < min_dist:
                 min_dist = dist
                 best_leaf = leaf
@@ -188,8 +229,8 @@ def find_founder_candidates(tree_file, id_map):
                 "clade_id": f"Clade_{idx+1}",
                 "founder_short_id": short_id,
                 "founder_real_id": id_map.get(short_id, short_id),
-                "cluster_leaves": [l.name for l in leaves],
-                "cluster_size": len(leaves)
+                "cluster_leaves": [leaf.name for leaf, d in leaf_dists],
+                "cluster_size": len(leaf_dists)
             })
             
     # 클러스터 크기 순 정렬 후 반환
@@ -205,6 +246,8 @@ def main():
     parser.add_argument("-c", "--scale", type=int, default=1000, help="FracMinHash scale for Parabola")
     parser.add_argument("-p", "--threads", type=int, default=16, help="Number of threads")
     parser.add_argument("-f", "--filter_pct", type=float, default=1.0, help="Genome coverage filter threshold in percent (default: 1.0 for 1 percent)")
+    parser.add_argument("-t", "--threshold", type=float, default=0.5, help="Distance threshold for TE clade clustering (default: 0.5)")
+    parser.add_argument("-x", "--complexity", type=float, default=0.5, help="K-mer complexity threshold to drop tandem repeats (default: 0.5)")
     args = parser.parse_args()
 
     input_name = os.path.basename(args.input_dir.rstrip('/'))
@@ -215,7 +258,7 @@ def main():
     os.makedirs(work_dir, exist_ok=True)
     
     # 1. 오버랩 없는 윈도우 청크 생성
-    chunk_files, id_map = generate_non_overlapping_windows(args.input_dir, work_dir, args.window, args.threads)
+    chunk_files, id_map = generate_non_overlapping_windows(args.input_dir, work_dir, args.window, args.threads, args.complexity)
     
     # 2. Parabola 실행 (Sketch & Triangle)
     matrix_file, kept_files = run_parabola(chunk_files, work_dir, id_map, args.filter_pct, args.kmer, args.scale, args.threads)
@@ -226,7 +269,7 @@ def main():
     run_cmd(["fastme", "-i", matrix_file, "-o", tree_file, "-T", "16", "-s"])
     
     # 4. 트리 파싱 및 후보 클러스터 추출
-    candidates = find_founder_candidates(tree_file, id_map)
+    candidates = find_founder_candidates(tree_file, id_map, dist_threshold=args.threshold)
     
     print("\n[+] Top TE Clades Detected:")
     for c in candidates:
@@ -284,7 +327,7 @@ def main():
             for chrom, start, end, name in sorted(regions, key=lambda x: (x[0], int(x[1]))):
                 f.write(f"{chrom}\t{start}\t{end}\t{name}\n")
 
-    final_tree_file = os.path.join(results_dir, "tree.nwk")
+    final_tree_file = os.path.join(results_dir, f"{input_name}_tree.nwk")
     if os.path.exists(tree_file):
         with open(tree_file, "r") as f:
             tree_content = f.read()
