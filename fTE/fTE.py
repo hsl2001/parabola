@@ -18,6 +18,7 @@ def run_cmd(cmd_list, capture_out=False):
     return result.stdout if capture_out else None
 
 def stream_windows(fasta_path, window_size):
+    step_size = window_size // 2
     with open(fasta_path, 'r') as f:
         current_chrom = None
         buffer = []
@@ -41,18 +42,18 @@ def stream_windows(fasta_path, window_size):
                     window_seq = full_str[:window_size]
                     yield current_chrom, chrom_pos, window_seq
                     
-                    rest = full_str[window_size:]
+                    rest = full_str[step_size:]
                     buffer = [rest]
                     buffer_len = len(rest)
-                    chrom_pos += window_size
+                    chrom_pos += step_size
 
 def write_chunk(chunk_file, short_id, seq):
     with open(chunk_file, "w") as f:
         f.write(f">{short_id}\n{seq}\n")
 
-def generate_non_overlapping_windows(input_dir, work_dir, window_size=10000, threads=8, complexity_threshold=0.5):
-    """오버랩 없이 유전체를 분할하여 개별 FASTA 파일로 저장 (고성능/저메모리 버전)"""
-    print(f"[*] Generating {window_size}bp non-overlapping windows (complexity >= {complexity_threshold})...")
+def generate_windows(input_dir, work_dir, window_size=10000, threads=8):
+    """윈도우 크기의 절반(step size) 간격으로 유전체를 분할하여 개별 FASTA 파일로 저장 (고성능/저메모리 버전)"""
+    print(f"[*] Generating {window_size}bp windows with {window_size//2}bp step...")
     fasta_files = glob.glob(os.path.join(input_dir, "*.fa*"))
     
     chunks_dir = os.path.join(work_dir, "chunks")
@@ -61,12 +62,6 @@ def generate_non_overlapping_windows(input_dir, work_dir, window_size=10000, thr
     id_map = {}
     chunk_files = []
     window_counter = 0
-    filtered_counter = 0
-    
-    def get_complexity(seq, k=15):
-        if len(seq) < k: return 0.0
-        kmers = set(seq[i:i+k] for i in range(len(seq)-k+1))
-        return len(kmers) / (len(seq) - k + 1)
     
     with ThreadPoolExecutor(max_workers=threads) as executor:
         futures = []
@@ -74,11 +69,6 @@ def generate_non_overlapping_windows(input_dir, work_dir, window_size=10000, thr
             genome_id = os.path.basename(fasta).split('.')[0]
             for chrom, start, seq in stream_windows(fasta, window_size):
                 window_counter += 1
-                
-                comp = get_complexity(seq)
-                if comp < complexity_threshold:
-                    filtered_counter += 1
-                    continue
                 
                 short_id = f"W{window_counter:05d}"
                 real_id = f"{genome_id}|{chrom}|{start}-{start + window_size}"
@@ -93,11 +83,10 @@ def generate_non_overlapping_windows(input_dir, work_dir, window_size=10000, thr
         for future in futures:
             future.result()
                 
-    print(f"    -> Total {window_counter} windows scanned, {filtered_counter} TR windows dropped.")
-    print(f"    -> {len(chunk_files)} valid windows generated.")
+    print(f"    -> Total {window_counter} valid windows generated.")
     return chunk_files, id_map
 
-def run_parabola(fasta_files, work_dir, id_map, filter_pct, k=21, scale=1000, threads=8):
+def run_parabola(fasta_files, work_dir, id_map, copy_threshold, k=21, scale=1000, threads=8):
     """Parabola sketch 및 triangle을 이용한 거리 행렬 계산"""
     print(f"[*] Running Parabola (k={k}, s={scale}, threads={threads})...")
     
@@ -110,67 +99,84 @@ def run_parabola(fasta_files, work_dir, id_map, filter_pct, k=21, scale=1000, th
     
     # 2. Parabola Triangle
     sketch_files = [f + ".parabola" for f in fasta_files]
-    cmd_triangle = ["./parabola", "triangle"] + sketch_files
-    matrix_out = run_cmd(cmd_triangle, capture_out=True)
+    triangle_out = os.path.join(work_dir, "triangle.tsv")
     
-    # FastME는 full square matrix만 지원하므로 lower-triangular를 square matrix로 변환
-    lines = matrix_out.strip().split('\n')
-    if not lines:
-        return ""
-        
-    try:
-        num_taxa = int(lines[0].strip())
-    except ValueError:
-        print("[Error] Invalid matrix size from parabola triangle")
-        sys.exit(1)
-        
-    taxa_names = []
-    dists = [[0.0] * num_taxa for _ in range(num_taxa)]
-    
-    for i in range(num_taxa):
-        line = lines[i + 1]
-        parts = line.split('\t')
-        taxa_names.append(parts[0])
-        for j in range(1, len(parts)):
-            val = parts[j].split(',')[0]
-            d = float(val)
-            dists[i][j - 1] = d
-            dists[j - 1][i] = d
+    print("[*] Calculating distance matrix ...")
+    with open(triangle_out, "w") as f_out:
+        cmd_triangle = ["./parabola", "triangle"] + sketch_files
+        res = subprocess.run(cmd_triangle, stdout=f_out, stderr=subprocess.PIPE, text=True)
+        if res.returncode != 0:
+            print(f"[Error] Command failed: {' '.join(cmd_triangle[:5])} ...\n{res.stderr}")
+            sys.exit(1)
             
-    # 3. 한 유전체 내에서 지정된 비율(filter_pct%)의 chunk에서 검출되지 않는 chunk(즉, 동일 유전체 내에서 distance < 1.0인 chunk가 지정 비율 미만인 경우)는 필터링
-    keep_indices = []
-    genome_to_chunks = {}
-    for idx, path in enumerate(fasta_files):
-        short_id = os.path.basename(path).split('.')[0]
-        genome_id = id_map[short_id].split('|')[0]
-        if genome_id not in genome_to_chunks:
-            genome_to_chunks[genome_id] = []
-        genome_to_chunks[genome_id].append(idx)
+    # 3. 1차 패스: 동일 유전체 내에서 distance < 1.0인 카운트 계산
+    print("[*] Pass 1: Filtering chunks...")
+    genome_ids = [id_map[os.path.basename(p).split('.')[0]].split('|')[0] for p in fasta_files]
+    counts = [0] * len(fasta_files)
+    taxa_names = []
+    
+    with open(triangle_out, 'r') as f:
+        first_line = f.readline()
+        if not first_line:
+            return ""
+        num_taxa = int(first_line.strip())
         
-    for genome_id, indices in genome_to_chunks.items():
-        n_g = len(indices)
-        threshold = (filter_pct / 100.0) * n_g
-        for i in indices:
-            detected_count = sum(1 for j in indices if dists[i][j] < 1.0)
-            if detected_count >= threshold:
-                keep_indices.append(i)
-                
+        for i in range(num_taxa):
+            line = f.readline()
+            parts = line.strip().split('\t')
+            taxa_names.append(parts[0])
+            g_i = genome_ids[i]
+            for j in range(1, len(parts)):
+                real_j = j - 1
+                if genome_ids[real_j] == g_i:
+                    val = float(parts[j].split(',')[0])
+                    if 0.0 < val < 1.0:
+                        counts[i] += 1
+                        counts[real_j] += 1
+                        
+    keep_indices = [i for i, c in enumerate(counts) if c >= copy_threshold]
+    
     if len(keep_indices) < 3:
         print("[*] Warning: Too few chunks kept after filtering. Keeping all chunks.")
         keep_indices = list(range(num_taxa))
     else:
         print(f"[*] Filtered out {num_taxa - len(keep_indices)} unique chunks. Keeping {len(keep_indices)} repetitive chunks.")
         
+    # 4. 2차 패스: 살아남은 chunk들만의 거리 행렬 추출
+    print("[*] Pass 2: Extracting distance matrix for kept chunks...")
+    keep_set = set(keep_indices)
+    keep_idx_map = {old_i: new_i for new_i, old_i in enumerate(keep_indices)}
     num_kept = len(keep_indices)
+    
+    dists_kept = [[0.0] * num_kept for _ in range(num_kept)]
+    
+    with open(triangle_out, 'r') as f:
+        f.readline() # skip num_taxa
+        for i in range(num_taxa):
+            line = f.readline()
+            if i not in keep_set:
+                continue
+                
+            parts = line.strip().split('\t')
+            for j in range(1, len(parts)):
+                real_j = j - 1
+                if real_j in keep_set:
+                    val = float(parts[j].split(',')[0])
+                    new_i = keep_idx_map[i]
+                    new_j = keep_idx_map[real_j]
+                    dists_kept[new_i][new_j] = val
+                    dists_kept[new_j][new_i] = val
+                    
+    # 5. FastME 포맷으로 저장 및 dist_dict 생성
     phylip_lines = [str(num_kept)]
-    dist_dict = {}
-    for i in keep_indices:
-        row = f"{taxa_names[i]} " + " ".join(f"{dists[i][j]:.6f}" for j in keep_indices)
+    dist_dict = collections.defaultdict(dict)
+    for new_i, old_i in enumerate(keep_indices):
+        name = taxa_names[old_i]
+        row = f"{name} " + " ".join(f"{dists_kept[new_i][new_j]:.6f}" for new_j in range(num_kept))
         phylip_lines.append(row)
         
-        dist_dict[taxa_names[i]] = {}
-        for j in keep_indices:
-            dist_dict[taxa_names[i]][taxa_names[j]] = dists[i][j]
+        for new_j, old_j in enumerate(keep_indices):
+            dist_dict[name][taxa_names[old_j]] = dists_kept[new_i][new_j]
             
     matrix_file = os.path.join(work_dir, "distance_matrix.phy")
     with open(matrix_file, "w") as f:
@@ -275,39 +281,23 @@ def find_founder_candidates(tree_file, id_map, dist_dict, k_clusters="auto", max
             
     # 최적 K 결정 이후 진짜 외군(Basal leaf) 탐색
     keep_edges = sorted_edges[best_k-1:] if best_k > 1 else sorted_edges
-    cut_edges = sorted_edges[:best_k-1] if best_k > 1 else []
-    components, adj_weighted = get_connected_components(all_nodes, keep_edges, return_weighted_adj=True)
+    components, _ = get_connected_components(all_nodes, keep_edges)
             
     candidates = []
+    all_leaf_names = set(n.name for n in all_nodes if n.name and n.is_terminal())
+    
     for idx, comp_nodes in enumerate(components):
-        comp_leaves = [n for n in comp_nodes if n.name and n.is_terminal()]
+        comp_leaves = [n.name for n in comp_nodes if n.name and n.is_terminal()]
         if not comp_leaves: continue
             
-        cut_nodes = []
-        for u, v, w in cut_edges:
-            if u in comp_nodes and v not in comp_nodes: cut_nodes.append(u)
-            elif v in comp_nodes and u not in comp_nodes: cut_nodes.append(v)
+        outside_leaves = [l for l in all_leaf_names if l not in comp_leaves]
                 
-        best_leaf = None
-        if not cut_nodes:
-            # K=1 이거나 외부 연결점이 없는 경우 중심점(Medoid) 사용
-            leaf_names = [n.name for n in comp_leaves]
-            best_leaf = min(leaf_names, key=lambda l: 0 if len(leaf_names) == 1 else sum(dist_dict[l][o] for o in leaf_names if o != l) / (len(leaf_names)-1))
+        if not outside_leaves:
+            # K=1 이거나 외군이 없는 경우: 클러스터 내부의 중심점(Medoid) 사용
+            best_leaf = min(comp_leaves, key=lambda l: 0 if len(comp_leaves) == 1 else sum(dist_dict[l][o] for o in comp_leaves if o != l) / (len(comp_leaves)-1))
         else:
-            # 외부(cut edge)와 연결된 노드들부터 시작하여 BFS/Dijkstra
-            pq = [(0, 0.0, id(cn), cn) for cn in cut_nodes]
-            shortest_paths = {}
-            while pq:
-                tdist, bdist, _, curr = heapq.heappop(pq)
-                if curr in shortest_paths: continue
-                shortest_paths[curr] = (tdist, bdist)
-                
-                for neighbor, w in adj_weighted[curr]:
-                    if neighbor not in shortest_paths:
-                        heapq.heappush(pq, (tdist + 1, bdist + w, id(neighbor), neighbor))
-                        
-            best_leaf_node = min(comp_leaves, key=lambda n: shortest_paths.get(n, (float('inf'), float('inf'))))
-            best_leaf = best_leaf_node.name
+            # K>1: 클러스터 외부 서열들(Outgroup)과의 평균 거리가 가장 짧은 서열을 이 클러스터의 뿌리(Basal)로 지정
+            best_leaf = min(comp_leaves, key=lambda l: sum(dist_dict[l][o] for o in outside_leaves) / len(outside_leaves))
 
         if best_leaf:
             short_id = best_leaf.split('.')[0]
@@ -348,10 +338,9 @@ def main():
     parser.add_argument("-k", "--kmer", type=int, default=21, help="K-mer size for Parabola")
     parser.add_argument("-c", "--scale", type=int, default=1000, help="FracMinHash scale for Parabola")
     parser.add_argument("-p", "--threads", type=int, default=16, help="Number of threads")
-    parser.add_argument("-f", "--filter_pct", type=float, default=0.5, help="Genome coverage filter threshold in percent (default: 0.5)")
+    parser.add_argument("-y", "--copy", type=int, default=40, help="Minimum copy number threshold for a TE chunk (default: 3)")
     parser.add_argument("-k_cls", "--k_clusters", type=str, default="auto", help="Number of clusters to cut the tree into, or 'auto' to find optimal K (default: auto)")
     parser.add_argument("-max_k", "--max_k", type=int, default=20, help="Maximum K to test when k_clusters is 'auto' (default: 20)")
-    parser.add_argument("-x", "--complexity", type=float, default=0.5, help="K-mer complexity threshold to drop tandem repeats (default: 0.5)")
     args = parser.parse_args()
 
     input_name = os.path.basename(args.input_dir.rstrip('/'))
@@ -360,16 +349,16 @@ def main():
         shutil.rmtree(work_dir)
     os.makedirs(work_dir, exist_ok=True)
     
-    # 1. 오버랩 없는 윈도우 청크 생성
-    chunk_files, id_map = generate_non_overlapping_windows(args.input_dir, work_dir, args.window, args.threads, args.complexity)
+    # 1. 윈도우 청크 생성
+    chunk_files, id_map = generate_windows(args.input_dir, work_dir, args.window, args.threads)
     
     # 2. Parabola 실행 (Sketch & Triangle)
-    matrix_file, kept_files, dist_dict = run_parabola(chunk_files, work_dir, id_map, args.filter_pct, args.kmer, args.scale, args.threads)
+    matrix_file, kept_files, dist_dict = run_parabola(chunk_files, work_dir, id_map, args.copy, args.kmer, args.scale, args.threads)
     
     # 3. FastME 계통수 구축
     print("[*] Building phylogenetic tree with FastME...")
     tree_file = os.path.join(work_dir, "tree.nwk")
-    run_cmd(["fastme", "-i", matrix_file, "-o", tree_file, "-T", "16", "-s"])
+    run_cmd(["fastme", "-i", matrix_file, "-o", tree_file, "-T", "16"])
     
     # 4. 트리 파싱 및 후보 클러스터 추출
     candidates = find_founder_candidates(tree_file, id_map, dist_dict, k_clusters=args.k_clusters, max_k=args.max_k)
