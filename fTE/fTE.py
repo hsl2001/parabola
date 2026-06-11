@@ -21,7 +21,7 @@ def run_cmd(cmd_list, capture_out=False):
 
 def stream_windows(fasta_path, window_size):
     step_size = window_size // 2
-    for record in SeqIO.parse(fasta_path, "fasta-blast"):
+    for record in SeqIO.parse(fasta_path, "fasta"):
         seq = str(record.seq).upper()
         seq_len = len(seq)
         for i in range(0, seq_len - window_size + 1, step_size):
