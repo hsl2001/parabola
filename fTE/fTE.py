@@ -91,7 +91,7 @@ def run_parabola(fasta_files, work_dir, id_map, copy_threshold, clip=0.0, k=21, 
             print(f"[Error] Command failed: {' '.join(cmd_triangle[:5])} ...\n{res.stderr}")
             sys.exit(1)
             
-    # 3. 1차 패스: 동일 유전체 내에서 distance < 1.0인 카운트 계산
+    # 3. 1차 패스: 동일 유전체 내에서 |distance| < clip 인 카운트 계산
     print("[*] Pass 1: Filtering chunks...")
     genome_ids = [id_map[os.path.basename(p).split('.')[0]].split('|')[0] for p in fasta_files]
     counts = [0] * len(fasta_files)
@@ -203,7 +203,7 @@ def main():
     parser.add_argument("-c", "--scale", type=int, default=1000, help="FracMinHash scale for Parabola")
     parser.add_argument("-p", "--threads", type=int, default=16, help="Number of threads")
     parser.add_argument("-y", "--copy", type=int, default=40, help="Minimum copy number threshold for a TE chunk (default: 3)")
-    parser.add_argument("--clip", type=float, default=0.2, help="Clip threshold for distance filtering (drops dist <= clip and dist >= 1.0 - clip) (default: 0.0)")
+    parser.add_argument("-l", "--clip", type=float, default=0.01, help="Clip threshold for distance filtering (drops dist <= clip and dist >= 1.0 - clip) (default: 0.0)")
     args = parser.parse_args()
 
     input_name = os.path.basename(args.input_dir.rstrip('/'))
@@ -237,7 +237,7 @@ def main():
     with open(tree_file, "r") as f:
         tree_content = f.read()
         
-    # 1. 음수 거리(Negative branch lengths)를 0.0으로 치환 (예: :-0.00123 -> :0.0)
+    # 1. 음수 거리(Negative branch lengths)를 0.0으로 치환
     tree_content = re.sub(r':-[0-9]+(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?', ':0.0', tree_content)
     
     # 2. 경로 및 확장자 제거 (가독성 향상)
