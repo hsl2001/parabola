@@ -20,7 +20,7 @@ def run_cmd(cmd_list, capture_out=False):
     return result.stdout if capture_out else None
 
 def stream_windows(fasta_path, window_size):
-    step_size = window_size // 2
+    step_size = window_size
     for record in SeqIO.parse(fasta_path, "fasta"):
         seq = str(record.seq).upper()
         seq_len = len(seq)
@@ -32,8 +32,8 @@ def write_chunk(chunk_file, short_id, seq):
         f.write(f">{short_id}\n{seq}\n")
 
 def generate_windows(input_dir, work_dir, window_size=10000, threads=8):
-    """윈도우 크기의 절반(step size) 간격으로 유전체를 분할하여 개별 FASTA 파일로 저장 (고성능/저메모리 버전)"""
-    print(f"[*] Generating {window_size}bp windows with {window_size//2}bp step...")
+    """유전체를 윈도우 크기 간격(오버랩 없음)으로 분할하여 개별 FASTA 파일로 저장 (고성능/저메모리 버전)"""
+    print(f"[*] Generating {window_size}bp windows (non-overlapping)...")
     fasta_files = []
     for ext in ("*.fasta", "*.fa", "*.fas", "*.fna"):
         fasta_files.extend(glob.glob(os.path.join(input_dir, ext)))
@@ -68,7 +68,7 @@ def generate_windows(input_dir, work_dir, window_size=10000, threads=8):
     print(f"    -> Total {window_counter} valid windows generated.")
     return chunk_files, id_map
 
-def run_parabola(fasta_files, work_dir, id_map, copy_threshold, clip=0.0, k=21, scale=1000, threads=8):
+def run_parabola(fasta_files, work_dir, id_map, copy_threshold, k=21, scale=1000, threads=8):
     """Parabola sketch 및 triangle을 이용한 거리 행렬 계산"""
     print(f"[*] Running Parabola (k={k}, s={scale}, threads={threads})...")
     
@@ -117,7 +117,7 @@ def run_parabola(fasta_files, work_dir, id_map, copy_threshold, clip=0.0, k=21, 
                 if real_j >= i:
                     break
                 val = float(parts[real_j + 1].split(',')[0])
-                if clip < val < 1.0 - clip:
+                if val < 1.0 :
                     counts[i] += 1
                     counts[real_j] += 1
                         
@@ -200,10 +200,9 @@ def main():
     parser.add_argument("-i", "--input_dir", required=True, help="Target FASTA directory")
     parser.add_argument("-w", "--window", type=int, default=10000, help="Non-overlapping window size (bp)")
     parser.add_argument("-k", "--kmer", type=int, default=21, help="K-mer size for Parabola")
-    parser.add_argument("-c", "--scale", type=int, default=1000, help="FracMinHash scale for Parabola")
+    parser.add_argument("-c", "--scale", type=int, default=100, help="FracMinHash scale for Parabola")
     parser.add_argument("-p", "--threads", type=int, default=16, help="Number of threads")
-    parser.add_argument("-y", "--copy", type=int, default=40, help="Minimum copy number threshold for a TE chunk (default: 3)")
-    parser.add_argument("-l", "--clip", type=float, default=0.01, help="Clip threshold for distance filtering (drops dist <= clip and dist >= 1.0 - clip) (default: 0.0)")
+    parser.add_argument("-y", "--copy", type=int, default=30, help="Minimum copy number threshold for a TE chunk (default: 3)")
     args = parser.parse_args()
 
     input_name = os.path.basename(args.input_dir.rstrip('/'))
@@ -216,7 +215,7 @@ def main():
     chunk_files, id_map = generate_windows(args.input_dir, work_dir, args.window, args.threads)
     
     # 2. Parabola 실행 (Sketch & Triangle)
-    matrix_file, kept_files, dist_dict = run_parabola(chunk_files, work_dir, id_map, args.copy, args.clip, args.kmer, args.scale, args.threads)
+    matrix_file, kept_files, dist_dict = run_parabola(chunk_files, work_dir, id_map, args.copy, args.kmer, args.scale, args.threads)
     
     # 3. FastME 계통수 구축
     print("[*] Building phylogenetic tree with FastME...")
