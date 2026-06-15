@@ -1031,7 +1031,7 @@ static void fte_dist_worker(void *data, long i, int _unused) {
 
 int cmd_fte(int argc, char **argv) {
   SketchBuildParams def = sketch_build_defaults();
-  def.scale = 10;
+  def.scale = 30;
   def.hash_seed = 42;
   size_t window_size = 10000;
   size_t min_bases = 1000;
