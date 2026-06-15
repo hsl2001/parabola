@@ -747,8 +747,8 @@ static void print_usage(void) {
          "  three  [-j] <ref> <query1> <query2>\n"
          "  triangle [-j] <sketch|fasta1> ... <sketch|fastaN>\n"
          "         -j: use Jukes-Cantor distance correction\n"
-         "  fte    [-k K] [-s S] [-w win] [-b min_bases] [-d identity] [-y "
-         "min_close] [-n] [-j] "
+         "  dup    [-k K] [-s S] [-w win] [-b min_bases] [-d identity] [-y "
+         "min_copy] [-j] "
          "fasta1 [fasta2 ...]\n"
          "  info   <sketch>\n"
          "\n");
@@ -930,7 +930,7 @@ int cmd_three(int argc, char **argv) {
   return 0;
 }
 
-static int fte_stream(const char *filename, const Parabola *p,
+static int dup_stream(const char *filename, const Parabola *p,
                       SketchBuildParams *params, size_t window_size,
                       size_t min_bases, ParabolaSketch **sketches,
                       size_t *num_sketches, size_t *cap_sketches,
@@ -1000,50 +1000,51 @@ static int fte_stream(const char *filename, const Parabola *p,
 
 typedef struct {
   ParabolaSketch *sketches;
-  int *is_founder;
-  int *close_count;
-  int *far_count;
+  int *is_dup;
+  int *copy_count;
+  int **copy_indices;
+  int *notcopy_count;
   double L;
   double H;
   int use_jc;
-} FteWorkerData;
+} DupWorkerData;
 
-static void fte_dist_worker(void *data, long i, int _unused) {
+static void dup_dist_worker(void *data, long i, int _unused) {
   (void)_unused;
-  FteWorkerData *wd = (FteWorkerData *)data;
+  DupWorkerData *wd = (DupWorkerData *)data;
   for (size_t j = 0; j < (size_t)i; j++) {
-    if (!wd->is_founder[i] && !wd->is_founder[j])
+    if (!wd->is_dup[i] && !wd->is_dup[j])
       continue;
     ParabolaDistResult d = parabola_dist(&wd->sketches[i], &wd->sketches[j]);
     double dist = wd->use_jc ? d.distance_jc : d.distance;
     if (dist >= wd->L && dist <= wd->H) {
-      wd->is_founder[i] = 0;
-      wd->is_founder[j] = 0;
+      wd->is_dup[i] = 0;
+      wd->is_dup[j] = 0;
     } else if (dist < wd->L) {
-      __sync_fetch_and_add(&wd->close_count[i], 1);
-      __sync_fetch_and_add(&wd->close_count[j], 1);
+      int idx_i = __sync_fetch_and_add(&wd->copy_count[i], 1);
+      wd->copy_indices[i][idx_i] = j;
+      int idx_j = __sync_fetch_and_add(&wd->copy_count[j], 1);
+      wd->copy_indices[j][idx_j] = i;
     } else if (dist > wd->H) {
-      __sync_fetch_and_add(&wd->far_count[i], 1);
-      __sync_fetch_and_add(&wd->far_count[j], 1);
+      __sync_fetch_and_add(&wd->notcopy_count[i], 1);
+      __sync_fetch_and_add(&wd->notcopy_count[j], 1);
     }
   }
 }
 
-int cmd_fte(int argc, char **argv) {
+int cmd_dup(int argc, char **argv) {
   SketchBuildParams def = sketch_build_defaults();
-  def.scale = 30;
+  def.scale = 10;
   def.hash_seed = 42;
   size_t window_size = 10000;
   size_t min_bases = 1000;
   double identity_th = 0.8;
   int use_jc = 0;
-  int min_close = 3;
-  int allow_repeats = 0;
+  int min_copy = 3;
 
   ketopt_t opt = KETOPT_INIT;
   int c;
-  while ((c = ketopt(&opt, argc - 1, argv + 1, 1, "k:s:e:w:b:d:y:nj", 0)) >=
-         0) {
+  while ((c = ketopt(&opt, argc - 1, argv + 1, 1, "k:s:e:w:b:d:y:j", 0)) >= 0) {
     if (c == 'k')
       def.kmer_size = (uint32_t)atoi(opt.arg);
     else if (c == 's')
@@ -1057,9 +1058,7 @@ int cmd_fte(int argc, char **argv) {
     else if (c == 'd')
       identity_th = atof(opt.arg);
     else if (c == 'y')
-      min_close = atoi(opt.arg);
-    else if (c == 'n')
-      allow_repeats = 1;
+      min_copy = atoi(opt.arg);
     else if (c == 'j')
       use_jc = 1;
     else
@@ -1091,7 +1090,7 @@ int cmd_fte(int argc, char **argv) {
   }
 
   for (int i = 0; i < num_files; i++) {
-    fte_stream(in_files[i], &p, &def, window_size, min_bases, &sketches,
+    dup_stream(in_files[i], &p, &def, window_size, min_bases, &sketches,
                &num_sketches, &cap_sketches, bed_fp);
   }
   fclose(bed_fp);
@@ -1102,74 +1101,55 @@ int cmd_fte(int argc, char **argv) {
     return 1;
   }
 
-  int *is_founder = calloc(num_sketches, sizeof(int));
-  int *close_count = calloc(num_sketches, sizeof(int));
-  int *far_count = calloc(num_sketches, sizeof(int));
+  int *is_dup = calloc(num_sketches, sizeof(int));
+  int *copy_count = calloc(num_sketches, sizeof(int));
+  int **copy_indices = malloc(num_sketches * sizeof(int *));
+  for (size_t i = 0; i < num_sketches; i++) {
+    copy_indices[i] = malloc(num_sketches * sizeof(int));
+  }
+  int *notcopy_count = calloc(num_sketches, sizeof(int));
   for (size_t i = 0; i < num_sketches; i++)
-    is_founder[i] = 1;
+    is_dup[i] = 1;
 
   int n_threads =
-      def.num_threads > 1 ? def.num_threads : 8; // Default to 8 threads for fte
-  FteWorkerData wd = {sketches, is_founder, close_count, far_count,
-                      L,        H,          use_jc};
-  kt_for(n_threads, fte_dist_worker, &wd, num_sketches);
+      def.num_threads > 1 ? def.num_threads : 8; // Default to 8 threads for dup
+  DupWorkerData wd = {sketches,      is_dup, copy_count, copy_indices,
+                      notcopy_count, L,      H,          use_jc};
+  kt_for(n_threads, dup_dist_worker, &wd, num_sketches);
 
-  FILE *fnd_fp = fopen("founder.txt", "w");
-  if (!fnd_fp) {
-    fprintf(stderr, "Error: cannot open founder.txt for writing\n");
+  FILE *dup_fp = fopen("dup.txt", "w");
+  if (!dup_fp) {
+    fprintf(stderr, "Error: cannot open dup.txt for writing\n");
     for (size_t i = 0; i < num_sketches; i++)
       parabola_sketch_free(&sketches[i]);
     free(sketches);
-    free(is_founder);
-    free(close_count);
-    free(far_count);
+    free(is_dup);
+    free(copy_count);
+    free(notcopy_count);
     return 1;
   }
 
-  size_t *fnd_idx = malloc(num_sketches * sizeof(size_t));
-  size_t n_fnd = 0;
   for (size_t i = 0; i < num_sketches; i++) {
-    if (is_founder[i] && close_count[i] >= min_close && far_count[i] > 0) {
-      fnd_idx[n_fnd++] = i;
+    if (is_dup[i] && copy_count[i] >= min_copy && notcopy_count[i] > 0) {
+      fprintf(dup_fp, "%s\t%d\t", sketches[i].name, copy_count[i]);
+      for (int c = 0; c < copy_count[i]; c++) {
+        fprintf(dup_fp, "%s%s", sketches[copy_indices[i][c]].name,
+                c == copy_count[i] - 1 ? "" : ",");
+      }
+      fprintf(dup_fp, "\n");
     }
   }
-
-  for (size_t k = 0; k < n_fnd; k++) {
-    size_t i = fnd_idx[k];
-
-    if (!allow_repeats) {
-      int is_repeat = 0;
-      if (k > 0) {
-        size_t prev = fnd_idx[k - 1];
-        if (close_count[prev] == close_count[i] &&
-            far_count[prev] == far_count[i]) {
-          is_repeat = 1;
-        }
-      }
-      if (k + 1 < n_fnd) {
-        size_t next = fnd_idx[k + 1];
-        if (close_count[next] == close_count[i] &&
-            far_count[next] == far_count[i]) {
-          is_repeat = 1;
-        }
-      }
-      if (is_repeat)
-        continue;
-    }
-
-    fprintf(fnd_fp, "%s\t%d\t%d\n", sketches[i].name, close_count[i],
-            far_count[i]);
-  }
-  free(fnd_idx);
-  fclose(fnd_fp);
+  fclose(dup_fp);
 
   for (size_t i = 0; i < num_sketches; i++) {
     parabola_sketch_free(&sketches[i]);
+    free(copy_indices[i]);
   }
+  free(copy_indices);
   free(sketches);
-  free(is_founder);
-  free(close_count);
-  free(far_count);
+  free(is_dup);
+  free(copy_count);
+  free(notcopy_count);
 
   return 0;
 }
@@ -1242,8 +1222,8 @@ int main(int argc, char **argv) {
     return cmd_three(argc, argv);
   if (strcmp(cmd, "triangle") == 0)
     return cmd_triangle(argc, argv);
-  if (strcmp(cmd, "fte") == 0)
-    return cmd_fte(argc, argv);
+  if (strcmp(cmd, "dup") == 0)
+    return cmd_dup(argc, argv);
   if (strcmp(cmd, "info") == 0)
     return cmd_info(argc, argv);
 
