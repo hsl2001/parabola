@@ -1,8 +1,8 @@
 #ifndef PARABOLA_H
 #define PARABOLA_H
 
-#include <stdint.h>
 #include <stddef.h>
+#include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -74,11 +74,10 @@ void parabola_stream(const char *filename, const Parabola *p, HashPool *pool,
                      int min_count, uint8_t *cms_table, size_t cms_mask);
 void parabola_sketch_free(ParabolaSketch *sk);
 ParabolaDistResult parabola_dist(const ParabolaSketch *ref,
-                                 const ParabolaSketch *query, int use_jc);
+                                 const ParabolaSketch *query);
 ParabolaTripleDistResult parabola_dist_three(const ParabolaSketch *ref,
                                              const ParabolaSketch *q1,
-                                             const ParabolaSketch *q2,
-                                             int use_jc);
+                                             const ParabolaSketch *q2);
 void parabola_info(const ParabolaSketch *sk);
 int parabola_sketch_save(const ParabolaSketch *sk, const char *filepath);
 int parabola_sketch_load(ParabolaSketch *sk, const char *filepath);
