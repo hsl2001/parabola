@@ -1013,13 +1013,14 @@ static void dup_dist_worker(void *data, long i, int _unused) {
   (void)_unused;
   DupWorkerData *wd = (DupWorkerData *)data;
   for (size_t j = 0; j < (size_t)i; j++) {
-    if (!wd->is_dup[i] && !wd->is_dup[j])
+    if (!__atomic_load_n(&wd->is_dup[i], __ATOMIC_RELAXED) &&
+        !__atomic_load_n(&wd->is_dup[j], __ATOMIC_RELAXED))
       continue;
     ParabolaDistResult d = parabola_dist(&wd->sketches[i], &wd->sketches[j]);
     double dist = wd->use_jc ? d.distance_jc : d.distance;
     if (dist >= wd->L && dist <= wd->H) {
-      wd->is_dup[i] = 0;
-      wd->is_dup[j] = 0;
+      __atomic_store_n(&wd->is_dup[i], 0, __ATOMIC_RELAXED);
+      __atomic_store_n(&wd->is_dup[j], 0, __ATOMIC_RELAXED);
     } else if (dist < wd->L) {
       int idx_i = __sync_fetch_and_add(&wd->copy_count[i], 1);
       wd->copy_indices[i][idx_i] = j;
