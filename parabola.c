@@ -1091,8 +1091,39 @@ int cmd_dup(int argc, char **argv) {
   }
 
   for (int i = 0; i < num_files; i++) {
-    dup_stream(in_files[i], &p, &def, window_size, min_bases, &sketches,
-               &num_sketches, &cap_sketches, bed_fp);
+    if (is_sequence_file(in_files[i])) {
+      dup_stream(in_files[i], &p, &def, window_size, min_bases, &sketches,
+                 &num_sketches, &cap_sketches, bed_fp);
+    } else {
+      FILE *list_fp = fopen(in_files[i], "r");
+      if (!list_fp) {
+        fprintf(stderr, "Error: cannot open file %s\n", in_files[i]);
+        fclose(bed_fp);
+        for (size_t k = 0; k < num_sketches; k++) {
+          parabola_sketch_free(&sketches[k]);
+        }
+        free(sketches);
+        return 1;
+      }
+      char line[1024];
+      while (fgets(line, sizeof(line), list_fp)) {
+        char *start = line;
+        while (*start && (*start == ' ' || *start == '\t' || *start == '\n' || *start == '\r')) {
+          start++;
+        }
+        size_t len = strlen(start);
+        while (len > 0 && (start[len - 1] == ' ' || start[len - 1] == '\t' || start[len - 1] == '\n' || start[len - 1] == '\r')) {
+          start[len - 1] = '\0';
+          len--;
+        }
+        if (len == 0) {
+          continue;
+        }
+        dup_stream(start, &p, &def, window_size, min_bases, &sketches,
+                   &num_sketches, &cap_sketches, bed_fp);
+      }
+      fclose(list_fp);
+    }
   }
   fclose(bed_fp);
 
