@@ -2,3 +2,4 @@
 .venv/
 parabola
 tmp_*
+*.fasta

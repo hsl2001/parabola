@@ -1,8 +1,8 @@
 CC = gcc
 CFLAGS = -O3 -march=native -Wall -Wextra
 LDFLAGS = -lm -lpthread -lz
-TARGET = parabola
-SRCS = parabola.c klib/kthread.c
+TARGET = reverb
+SRCS = reverb.c klib/kthread.c
 
 .PHONY: clean static
 
