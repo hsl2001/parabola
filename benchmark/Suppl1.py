@@ -289,6 +289,7 @@ def accuracy_c_values(tool):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--snp", action="store_true")
+    parser.add_argument("--no-fastani", action="store_true", help="Disable FastANI benchmark")
     args = parser.parse_args()
 
     WORK.mkdir(exist_ok=True)
@@ -320,6 +321,8 @@ def main():
             acc_fastas, expected_dists = build_accuracy_fastas(rpath, args.snp)
 
             for tool in TOOLS:
+                if args.no_fastani and tool.name == "FastANI":
+                    continue
                 if tool.name in ["Skani", "FastANI"]:
                     k = "-"
                     row_times = bench_time_once(tool, aug_fastas, k)
