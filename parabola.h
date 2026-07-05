@@ -18,44 +18,17 @@ typedef struct {
 } Parabola;
 
 typedef struct {
-  uint64_t hash;
-  uint32_t simplicity;
-} HSPair;
-
-typedef struct {
-  size_t size;
-  size_t cap;
-  uint64_t hash_threshold;
-  uint64_t *hashes;
-  uint32_t *simps;
-} HashPool;
-
-typedef struct {
-  const uint8_t *read_sequence;
-  size_t sequence_length;
-  const Parabola *parameters;
-  size_t current_index;
-  __uint128_t forward_reverb;
-  size_t valid_length;
-} ParabolaIterator;
-
-typedef struct {
   char *name;
   uint32_t kmer_size;
   size_t sketch_size;
   uint64_t hash_threshold;
   uint64_t *hashes;
-  uint32_t *simplicities;
 } ParabolaSketch;
 
 typedef struct {
+  double containment;
   double distance;
-  double distance_jc;
-  double distance_naive;
-  double distance_naive_jc;
-  double jaccard;
   size_t shared_hashes;
-  size_t total_hashes;
 } ParabolaDistResult;
 
 typedef struct {
@@ -66,12 +39,6 @@ typedef struct {
 
 void parabola_init(Parabola *p, size_t hash_window);
 void kt_for(int n_threads, void (*func)(void *, long, int), void *data, long n);
-void parabola_sketch_create(ParabolaSketch *sk, const char *name,
-                            uint32_t kmer_size, size_t target_size,
-                            uint64_t hash_seed, const char **files,
-                            int num_files, int min_count, int num_threads);
-void parabola_stream(const char *filename, const Parabola *p, HashPool *pool,
-                     int min_count, uint8_t *cms_table, size_t cms_mask);
 void parabola_sketch_free(ParabolaSketch *sk);
 ParabolaDistResult parabola_dist(const ParabolaSketch *ref,
                                  const ParabolaSketch *query);

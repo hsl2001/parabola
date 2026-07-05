@@ -21,26 +21,24 @@ export PATH=$PATH:`pwd`
 parabola dist benchmark/test1.fasta benchmark/test2.fasta
 # Reference File      : benchmark/test1.fasta
 # Query File          : benchmark/test2.fasta
-# Shared Hashes       : 4 / 392
+# Shared Hashes       : 4
 # ------------------------------------
-# Jaccard Index       : 0.010204
-# Parabola Distance   : 0.197915
+# Average Containment : 0.020254
+# Parabola Distance   : 0.169466
 
 # Compute lower triangular distance metrix
 parabola triangle benchmark/test1.fasta benchmark/test2.fasta benchmark/test3.fasta
 # 3
 # benchmark/test1.fasta
-# benchmark/test2.fasta   0.197915
-# benchmark/test3.fasta   0.180695        0.183343
+# benchmark/test2.fasta   0.169466
+# benchmark/test3.fasta   0.173765        0.182878
 ```
 
 ### Background
 Alignment-free methods were developed to avoid limitations of alignment-based methods, such as large computational demands which often reach as infeasible on large genomic datasets.
 As one of the alignment-free methods, genome sketching method circumvents complex alignments from large genomic sequences. 
 However, existing genome sketching methods often underestimates evolutionary distance (often assumed as genomic dissimilarity) due to sequence homoplasy, which indicates homology arised by random chances.
-To resolve these accuracy limitations, Parabola introduces a simplicity-aware distance calibration method driven by a 3-bit encoding system called Reverb.
-Because low-complexity (high-simplicity) sequences gain homoplasy more easily, Parabola assesses sequence simplicity simultaneously during the hashing phase. 
-This allows the algorithm to isolate true phylogenetic signatures while discarding homoplasious noise, resulting in highly accurate distance estimations in sequences exceeding 20% divergence.
+To resolve these accuracy limitations, Parabola introduces a distance estimation method driven by a 3-bit encoding system called Reverb and Average Containment metric.
 
 ### Synopsis
 #### Installation using conda
@@ -55,10 +53,10 @@ Parabola utilizes a symmetric 3-bit nucleotide encoding system, Reverb, where th
 By design, complementary base pairs (A/T and C/G) are bit-reflections of each other.
 This structural symmetry allows Parabola to derive the reverse complement hash instantaneously using a 128-bit reversal operation, bypassing the need for an independent, character-wise traversal of the reverse strand.
 
-#### Simplicity calculation with Simpson's index
-To measure sequence simplicity without adding computational overhead, Parabola calculates the Simpson index using bitwise operations.
-Leveraging the trifold population count of the 3-bit encoded hashes, Parabola dynamically calculates the simplicity score using the paraboloid formula $D = A^2 + C^2 + G^2 + T^2$.
-This strand-agnostic scoring system maximizes the score for high-entropy sequences (where base frequencies approach 25%) and heavily penalizes uninformative extremums, such as homopolymers.
+#### Average Containment distance estimation
+Parabola calculates the Average Containment $C_{avg}$ of two sketches $A$ and $B$ as the arithmetic mean of the proportions of shared hashes:
+$$C_{avg} = \frac{1}{2} \left( \frac{|A \cap B|}{|A|} + \frac{|A \cap B|}{|B|} \right)$$
+The distance is then estimated as $d = 1 - C_{avg}^{1/k}$.
 
 #### FracMinHash
 Parabola employs a scaled hashing approach (FracMinHash) to compress genome sequences.
@@ -66,24 +64,13 @@ The algorithm establishes a strict hash threshold based on the defined scale fac
 Only generated *k*-mer hashes that fall below this numeric threshold are retained, creating a uniform fractional representation of the genome that remains stable even under high compression rates.
 
 #### Overflowing Max-Heap
-To manage the filtered hashes, Parabola buffers valid sequence hashes and their calculated simplicity scores into a dynamically resizing memory pool.
+To manage the filtered hashes, Parabola buffers valid sequence hashes into a dynamically resizing memory pool.
 Once the input stream is fully processed, the pool is finalized by sorting the hashes and deduplicating them.
-During deduplication, if identical hashes are found, Parabola retains only the lowest simplicity score associated with that hash, optimizing the final sketch representation.
-
-#### Isolating orthologous hash intersection with simplicity
-Parabola calibrates the final evolutionary distance by treating the intersection of two sketch sets as a mixture distribution of both orthologous hashes and hashes with homoplasy.
-By assuming the variance of simplicity for the homoplasy subpopulation converges to zero, Parabola calculates the homoplasious ratio ($x$).
-It then applies this ratio to a Poisson mutation model to generate a calibration term ($\alpha$), isolating true orthologous signals and correcting the naive Jaccard distance.
-
-#### Juke-Cantor distance correction
-Parabola provides an optional Jukes-Cantor distance correction, which can be enabled by passing the `-j` flag in the command-line interface.
-When this option is active, the calculated base distance ($d$) is adjusted using the formula $d_{JC} = -0.75 \times \ln(1.0 - \frac{4}{3}d)$.
-To prevent errors from extreme divergence, if the uncorrected distance is greater than or equal to 0.75, the corrected distance is automatically capped at a maximum value of 1.0.
 
 #### The `three` command for three-way intersection
 Parabola features a specific `three` command designed to simultaneously calculate distances between a single reference sketch and two separate query sketches.
-The syntax for this operation is `parabola three [-j] <ref> <query1> <query2>`. 
-Internally, the algorithm concurrently traverses the sorted hash sets of all three sequences to evaluate their intersections and simplicities in a single pass.
+The syntax for this operation is `parabola three <ref> <query1> <query2>`. 
+Internally, the algorithm concurrently traverses the sorted hash sets of all three sequences to evaluate their intersections in a single pass.
 As a result, it outputs three pairwise distance reports at once: reference versus query 1, reference versus query 2, and query 1 versus query 2.
 
 ### NGS Support

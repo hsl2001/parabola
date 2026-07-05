@@ -38,27 +38,18 @@ static uint64_t mix_hash(__uint128_t hash_value, uint64_t seed) {
 
 static size_t min_size_t(size_t a, size_t b) { return a < b ? a : b; }
 
-static int pop_count64(uint64_t x) {
-#if defined(__GNUC__) || defined(__clang__)
-  return __builtin_popcountll(x);
-#else
-  x -= (x >> 1) & 0x5555555555555555ULL;
-  x = (x & 0x3333333333333333ULL) + ((x >> 2) & 0x3333333333333333ULL);
-  x = (x + (x >> 4)) & 0x0F0F0F0F0F0F0F0FULL;
-  return (int)((x * 0x0101010101010101ULL) >> 56);
-#endif
-}
-
-static int pop_count128(__uint128_t x) {
-  return pop_count64((uint64_t)(x >> 64)) + pop_count64(x);
-}
-
 static uint64_t reverse_bits64(uint64_t n) {
+#if defined(__aarch64__)
+  uint64_t r;
+  __asm__("rbit %0, %1" : "=r"(r) : "r"(n));
+  return r;
+#else
   uint64_t r = __builtin_bswap64(n);
   r = ((r & 0x5555555555555555ULL) << 1) | ((r & 0xAAAAAAAAAAAAAAAAULL) >> 1);
   r = ((r & 0x3333333333333333ULL) << 2) | ((r & 0xCCCCCCCCCCCCCCCCULL) >> 2);
   r = ((r & 0x0F0F0F0F0F0F0F0FULL) << 4) | ((r & 0xF0F0F0F0F0F0F0F0ULL) >> 4);
   return r;
+#endif
 }
 
 static __uint128_t reverse_bits128(__uint128_t n) {
@@ -66,32 +57,9 @@ static __uint128_t reverse_bits128(__uint128_t n) {
          reverse_bits64((uint64_t)(n >> 64));
 }
 
-/* Simpson diversity index */
-static void calculate_score(const Parabola *p, __uint128_t fwd, __uint128_t rev,
-                            uint32_t *out_s, uint64_t *out_h) {
-  __uint128_t b0 = fwd & p->layer_mask;
-  __uint128_t b1 = (fwd >> 1) & p->layer_mask;
-
-  int k = (int)(p->kmer_bits / 3);
-
-  int pur = pop_count128(b0);
-  int gc = pop_count128(b1);
-  int g = pop_count128(b0 & b1);
-
-  int a = pur - g;
-  int c = gc - g;
-  int t = k - pur - gc + g;
-
-  *out_s = (uint32_t)((a * a + c * c) + (g * g + t * t));
-
-  __uint128_t canon = fwd < rev ? fwd : rev;
-  *out_h = mix_hash(canon, p->hash_seed);
-}
-
 // ==============================================================
 // UTILITIES
 // ==============================================================
-/* A = 001, C = 110, G = 011, T = 100 */
 void parabola_init(Parabola *p, size_t hash_window) {
   size_t k = min_size_t(hash_window, 42); /* 3*42 = 126 bits fits __uint128_t */
   uint32_t kmer_bits = 3 * (uint32_t)k;
@@ -113,9 +81,17 @@ void parabola_init(Parabola *p, size_t hash_window) {
 // OVERFLOWING MAX HEAP
 // ==============================================================
 
-static int cmp_hash(const void *a, const void *b) {
-  const HSPair *x = a, *y = b;
-  return (x->hash > y->hash) - (x->hash < y->hash);
+typedef struct {
+  size_t size;
+  size_t cap;
+  uint64_t hash_threshold;
+  uint64_t *hashes;
+} HashPool;
+
+static int cmp_uint64(const void *a, const void *b) {
+  uint64_t x = *(const uint64_t *)a;
+  uint64_t y = *(const uint64_t *)b;
+  return (x > y) - (x < y);
 }
 
 static void pool_init(HashPool *pool, uint64_t threshold) {
@@ -123,84 +99,53 @@ static void pool_init(HashPool *pool, uint64_t threshold) {
   pool->cap = 0;
   pool->hash_threshold = threshold;
   pool->hashes = NULL;
-  pool->simps = NULL;
 }
 
-static void pool_try_insert(HashPool *pool, uint64_t h, uint32_t s) {
+static void pool_try_insert(HashPool *pool, uint64_t h) {
   if (h >= pool->hash_threshold)
     return;
   if (pool->size == pool->cap) {
     size_t nc = pool->cap ? pool->cap * 2 : 64;
     uint64_t *nh = realloc(pool->hashes, nc * sizeof(uint64_t));
-    uint32_t *ns = realloc(pool->simps, nc * sizeof(uint32_t));
-    if (!nh || !ns)
+    if (!nh)
       return;
     pool->hashes = nh;
-    pool->simps = ns;
     pool->cap = nc;
   }
-  pool->hashes[pool->size] = h;
-  pool->simps[pool->size] = s;
-  pool->size++;
+  pool->hashes[pool->size++] = h;
 }
 
-static void pool_finalize(HashPool *pool, uint64_t **out_hashes,
-                          uint32_t **out_simps, size_t *out_size) {
+static void pool_finalize(HashPool *pool, uint64_t **out_hashes, size_t *out_size) {
   size_t n = pool->size;
   if (n) {
-    HSPair *tmp = malloc(n * sizeof(HSPair));
-    if (tmp) {
-      for (size_t i = 0; i < n; i++)
-        tmp[i] = (HSPair){pool->hashes[i], pool->simps[i]};
-      qsort(tmp, n, sizeof(HSPair), cmp_hash);
-      size_t u = 0;
-      for (size_t i = 0; i < n; i++) {
-        if (u && tmp[i].hash == tmp[u - 1].hash) {
-          if (tmp[i].simplicity < tmp[u - 1].simplicity)
-            tmp[u - 1].simplicity = tmp[i].simplicity;
-        } else {
-          tmp[u++] = tmp[i];
-        }
+    qsort(pool->hashes, n, sizeof(uint64_t), cmp_uint64);
+    size_t u = 0;
+    for (size_t i = 0; i < n; i++) {
+      if (u == 0 || pool->hashes[i] != pool->hashes[u - 1]) {
+        pool->hashes[u++] = pool->hashes[i];
       }
-      for (size_t i = 0; i < u; i++) {
-        pool->hashes[i] = tmp[i].hash;
-        pool->simps[i] = tmp[i].simplicity;
-      }
-      free(tmp);
-      n = u;
     }
+    n = u;
     uint64_t *nh = realloc(pool->hashes, n * sizeof(uint64_t));
-    uint32_t *ns = realloc(pool->simps, n * sizeof(uint32_t));
     if (nh)
       pool->hashes = nh;
-    if (ns)
-      pool->simps = ns;
   }
   *out_size = n;
   *out_hashes = n ? pool->hashes : NULL;
-  *out_simps = n ? pool->simps : NULL;
-  if (!n) {
-    free(pool->hashes);
-    free(pool->simps);
-  }
   pool->hashes = NULL;
-  pool->simps = NULL;
   pool->size = pool->cap = 0;
 }
 
 // ==============================================================
 // SKETCH EXTRACTION
 // ==============================================================
+__attribute__((hot))
 static void extract_and_insert(const Parabola *p, HashPool *pool,
                                const uint8_t *seq, size_t len, int min_count,
                                uint8_t *cms_table, size_t cms_mask) {
   size_t K = p->hash_window;
   __uint128_t fwd = 0;
   size_t valid = 0;
-
-  // double K_double = (double)p->hash_window;
-  // double S_max_limit = (K_double / 4.0) * 16.266 + (K_double * K_double
-  // / 4.0); // 11.345, 16.266 uint32_t S_threshold = (uint32_t)S_max_limit;
 
   for (size_t idx = 0; idx < len; idx++) {
     int8_t lv = BASE_LOOKUP[seq[idx]];
@@ -216,14 +161,8 @@ static void extract_and_insert(const Parabola *p, HashPool *pool,
 
     if (valid >= K) {
       __uint128_t rev = reverse_bits128(fwd) >> p->rc_shift;
-      uint32_t s;
-      uint64_t h;
-      calculate_score(p, fwd, rev, &s, &h);
-
-      // MAYBE: simplicity threshold filter???
-      // if (s > S_threshold) {
-      //   continue;
-      // }
+      __uint128_t canon = fwd < rev ? fwd : rev;
+      uint64_t h = mix_hash(canon, p->hash_seed);
 
       if (h >= pool->hash_threshold)
         continue;
@@ -254,7 +193,7 @@ static void extract_and_insert(const Parabola *p, HashPool *pool,
         }
       }
 
-      pool_try_insert(pool, h, s);
+      pool_try_insert(pool, h);
     }
   }
 }
@@ -287,177 +226,56 @@ void parabola_sketch_free(ParabolaSketch *sk) {
   if (sk) {
     free(sk->name);
     free(sk->hashes);
-    free(sk->simplicities);
   }
 }
 
 // ==============================================================
 // DISTANCE CALCULATION
 // ==============================================================
-typedef struct {
-  size_t inter, uni;
-  double sum_S_u, sum_S2_u, sum_S_i, sum_S2_i;
-} PairInfo;
-
-static void pair_update(PairInfo *acc, int inA, int inB, uint32_t sA,
-                        uint32_t sB, uint32_t kmer_size) {
-  double k = (double)kmer_size;
-  if (inA && inB) {
-    uint32_t S_i = sA > sB ? sA : sB;
-    double d = S_i / (k * k);
-    acc->inter++;
-    acc->uni++;
-    acc->sum_S_u += d;
-    acc->sum_S2_u += d * d;
-    acc->sum_S_i += d;
-    acc->sum_S2_i += d * d;
-  } else {
-    double d = inA ? sA / (k * k) : sB / (k * k);
-    acc->uni++;
-    acc->sum_S_u += d;
-    acc->sum_S2_u += d * d;
-  }
-}
-
-static ParabolaDistResult finalize_pair(const PairInfo *acc,
-                                        uint32_t kmer_size) {
-  ParabolaDistResult res = {1.0, 1.0, 1.0, 1.0, 0.0, acc->inter, acc->uni};
-
-  if (acc->uni == 0 || acc->inter == 0) {
-    res.jaccard = 0.0;
-    return res;
-  }
-
-  double mu_u = acc->sum_S_u / (double)acc->uni;
-  double V_u = (acc->sum_S2_u / (double)acc->uni) - mu_u * mu_u;
-  if (V_u < 0.0)
-    V_u = 0.0;
-
-  double mu_i = acc->sum_S_i / (double)acc->inter;
-  double V_i = (acc->sum_S2_i / (double)acc->inter) - mu_i * mu_i;
-  if (V_i < 0.0)
-    V_i = 0.0;
-
-  res.jaccard = (double)acc->inter / (double)acc->uni;
-  double J = res.jaccard;
-
-  double p_hat = 2.0 * J / (1.0 + J);
-  double k = (double)kmer_size;
-
-  double d_naive = 1.0 - pow(p_hat, 1.0 / k);
-
-  double delta_mu = mu_i - mu_u;
-  double delta_V = V_i - V_u;
-
-  double x = 0.0;
-
-  if (delta_mu > 0.0 && V_u > 1e-12) {
-    double B = delta_V + (delta_mu * delta_mu);
-    double discriminant = B * B + 4.0 * V_u * (delta_mu * delta_mu);
-    if (discriminant < 0.0)
-      discriminant = 0.0;
-
-    if (B > 0.0) {
-      x = (2.0 * delta_mu * delta_mu) / (B + sqrt(discriminant));
-    } else {
-      x = (-B + sqrt(discriminant)) / (2.0 * V_u);
-    }
-  }
-
-  if (x < 0.0)
-    x = 0.0;
-  if (x > 0.999999)
-    x = 0.999999;
-
-  double alpha = 1.0 - x;
-  double d = d_naive - (1.0 / k) * log(alpha);
-
-  double d_jc, d_naive_jc;
-
-  if (d >= 0.75) {
-    d_jc = 1.0;
-  } else {
-    d_jc = -0.75 * log(1.0 - (4.0 / 3.0) * d);
-  }
-
-  if (d_naive >= 0.75) {
-    d_naive_jc = 1.0;
-  } else {
-    d_naive_jc = -0.75 * log(1.0 - (4.0 / 3.0) * d_naive);
-  }
-
-  if (d < 0.0)
-    d = 0.0;
-  if (d > 1.0)
-    d = 1.0;
-  if (d_jc < 0.0)
-    d_jc = 0.0;
-  if (d_jc > 1.0)
-    d_jc = 1.0;
-  if (d_naive < 0.0)
-    d_naive = 0.0;
-  if (d_naive > 1.0)
-    d_naive = 1.0;
-  if (d_naive_jc < 0.0)
-    d_naive_jc = 0.0;
-  if (d_naive_jc > 1.0)
-    d_naive_jc = 1.0;
-
-  res.distance = d;
-  res.distance_jc = d_jc;
-  res.distance_naive = d_naive;
-  res.distance_naive_jc = d_naive_jc;
-
-  return res;
-}
-
 ParabolaDistResult parabola_dist(const ParabolaSketch *ref,
                                  const ParabolaSketch *query) {
-  ParabolaDistResult res = {1.0, 1.0, 1.0, 1.0, 0.0, 0, 0};
+  ParabolaDistResult res = {0.0, 1.0, 0};
   if (ref->kmer_size == 0 || query->kmer_size != ref->kmer_size)
     return res;
 
-  PairInfo acc = {0};
-  size_t i = 0, j = 0;
+  size_t shared = 0, i = 0, j = 0;
   while (i < ref->sketch_size && j < query->sketch_size) {
     if (ref->hashes[i] == query->hashes[j]) {
-      pair_update(&acc, 1, 1, ref->simplicities[i], query->simplicities[j],
-                  ref->kmer_size);
+      shared++;
       i++;
       j++;
     } else if (ref->hashes[i] < query->hashes[j]) {
-      pair_update(&acc, 1, 0, ref->simplicities[i], 0, ref->kmer_size);
       i++;
     } else {
-      pair_update(&acc, 0, 1, 0, query->simplicities[j], ref->kmer_size);
       j++;
     }
   }
-  while (i < ref->sketch_size)
-    pair_update(&acc, 1, 0, ref->simplicities[i++], 0, ref->kmer_size);
-  while (j < query->sketch_size)
-    pair_update(&acc, 0, 1, 0, query->simplicities[j++], ref->kmer_size);
 
-  return finalize_pair(&acc, ref->kmer_size);
+  res.shared_hashes = shared;
+  if (ref->sketch_size > 0 && query->sketch_size > 0) {
+    double ca = (double)shared / (double)ref->sketch_size;
+    double cb = (double)shared / (double)query->sketch_size;
+    res.containment = 0.5 * (ca + cb);
+    res.distance = 1.0 - pow(res.containment, 1.0 / (double)ref->kmer_size);
+  }
+  return res;
 }
 
 ParabolaTripleDistResult parabola_dist_three(const ParabolaSketch *ref,
                                              const ParabolaSketch *q1,
                                              const ParabolaSketch *q2) {
   ParabolaTripleDistResult t;
+  t.d01 = t.d02 = t.d12 = (ParabolaDistResult){0.0, 1.0, 0};
 
   if (ref->kmer_size == 0 || q1->kmer_size != ref->kmer_size ||
       q2->kmer_size != ref->kmer_size) {
-    t.d01 = t.d02 = t.d12 = (ParabolaDistResult){1.0, 1.0, 1.0, 1.0, 0.0, 0, 0};
     return t;
   }
 
   size_t nR = ref->sketch_size, n1 = q1->sketch_size, n2 = q2->sketch_size;
   const uint64_t *R = ref->hashes, *Q1 = q1->hashes, *Q2 = q2->hashes;
-  const uint32_t *Rs = ref->simplicities;
-  const uint32_t *Q1s = q1->simplicities, *Q2s = q2->simplicities;
 
-  PairInfo acc01 = {0}, acc02 = {0}, acc12 = {0};
+  size_t sh01 = 0, sh02 = 0, sh12 = 0;
 
   size_t i = 0, j = 0, k = 0;
   while (i < nR || j < n1 || k < n2) {
@@ -473,28 +291,32 @@ ParabolaTripleDistResult parabola_dist_three(const ParabolaSketch *ref,
     int inQ1 = (h1 == hm);
     int inQ2 = (h2 == hm);
 
-    uint32_t sR = inR ? Rs[i] : 0;
-    uint32_t s1 = inQ1 ? Q1s[j] : 0;
-    uint32_t s2 = inQ2 ? Q2s[k] : 0;
+    if (inR && inQ1) sh01++;
+    if (inR && inQ2) sh02++;
+    if (inQ1 && inQ2) sh12++;
 
-    if (inR || inQ1)
-      pair_update(&acc01, inR, inQ1, sR, s1, ref->kmer_size);
-    if (inR || inQ2)
-      pair_update(&acc02, inR, inQ2, sR, s2, ref->kmer_size);
-    if (inQ1 || inQ2)
-      pair_update(&acc12, inQ1, inQ2, s1, s2, ref->kmer_size);
-
-    if (inR)
-      i++;
-    if (inQ1)
-      j++;
-    if (inQ2)
-      k++;
+    if (inR) i++;
+    if (inQ1) j++;
+    if (inQ2) k++;
   }
 
-  t.d01 = finalize_pair(&acc01, ref->kmer_size);
-  t.d02 = finalize_pair(&acc02, ref->kmer_size);
-  t.d12 = finalize_pair(&acc12, ref->kmer_size);
+  double inv_k = 1.0 / (double)ref->kmer_size;
+
+  #define FILL(r, sh, a, b) do { \
+    (r).shared_hashes = (sh); \
+    if ((a)->sketch_size > 0 && (b)->sketch_size > 0) { \
+      double ca = (double)(sh) / (double)(a)->sketch_size; \
+      double cb = (double)(sh) / (double)(b)->sketch_size; \
+      (r).containment = 0.5 * (ca + cb); \
+      (r).distance = 1.0 - pow((r).containment, inv_k); \
+    } \
+  } while(0)
+
+  FILL(t.d01, sh01, ref, q1);
+  FILL(t.d02, sh02, ref, q2);
+  FILL(t.d12, sh12, q1, q2);
+  #undef FILL
+
   return t;
 }
 
@@ -528,7 +350,6 @@ int parabola_sketch_save(const ParabolaSketch *sk, const char *filepath) {
     fwrite(sk->name, 1, name_len, f);
   if (sk->sketch_size > 0) {
     fwrite(sk->hashes, sizeof(uint64_t), sk->sketch_size, f);
-    fwrite(sk->simplicities, sizeof(uint32_t), sk->sketch_size, f);
   }
   fclose(f);
   return 0;
@@ -549,7 +370,6 @@ int parabola_sketch_load(ParabolaSketch *sk, const char *filepath) {
   uint64_t sz = 0;
   sk->name = NULL;
   sk->hashes = NULL;
-  sk->simplicities = NULL;
 
   if (fread(&sk->kmer_size, sizeof(uint32_t), 1, f) != 1)
     goto err;
@@ -571,13 +391,9 @@ int parabola_sketch_load(ParabolaSketch *sk, const char *filepath) {
 
   if (sk->sketch_size > 0) {
     sk->hashes = (uint64_t *)malloc(sk->sketch_size * sizeof(uint64_t));
-    sk->simplicities = (uint32_t *)malloc(sk->sketch_size * sizeof(uint32_t));
-    if (!sk->hashes || !sk->simplicities)
+    if (!sk->hashes)
       goto err;
     if (fread(sk->hashes, sizeof(uint64_t), sk->sketch_size, f) !=
-        sk->sketch_size)
-      goto err;
-    if (fread(sk->simplicities, sizeof(uint32_t), sk->sketch_size, f) !=
         sk->sketch_size)
       goto err;
   }
@@ -588,10 +404,8 @@ int parabola_sketch_load(ParabolaSketch *sk, const char *filepath) {
 err:
   free(sk->name);
   free(sk->hashes);
-  free(sk->simplicities);
   sk->name = NULL;
   sk->hashes = NULL;
-  sk->simplicities = NULL;
   fclose(f);
   return -1;
 }
@@ -634,7 +448,7 @@ static int build_sketch_from_fasta(ParabolaSketch *sk, const char *path,
   HashPool pool;
   pool_init(&pool, sk->hash_threshold);
   parabola_stream(path, &p, &pool, params->min_count, NULL, 0);
-  pool_finalize(&pool, &sk->hashes, &sk->simplicities, &sk->sketch_size);
+  pool_finalize(&pool, &sk->hashes, &sk->sketch_size);
 
   return sk->sketch_size > 0 ? 0 : -1;
 }
@@ -711,21 +525,13 @@ static void free_ready_sketches(ParabolaSketch *sketches, const int *ready,
 
 static void print_distance_report(const ParabolaSketch *ref,
                                   const ParabolaSketch *query,
-                                  const ParabolaDistResult *dist, int use_jc) {
+                                  const ParabolaDistResult *dist) {
   printf("Reference File      : %s\n", ref->name);
   printf("Query File          : %s\n", query->name);
-  printf("Shared Hashes       : %zu / %zu\n", dist->shared_hashes,
-         dist->total_hashes);
+  printf("Shared Hashes       : %zu\n", dist->shared_hashes);
   printf("------------------------------------\n");
-  printf("Jaccard Index       : %f\n", dist->jaccard);
+  printf("Average Containment : %f\n", dist->containment);
   printf("Parabola Distance   : %f\n", dist->distance);
-  if (use_jc) {
-    printf("Parabola Dist. (JC) : %f\n", dist->distance_jc);
-  }
-  printf("Naive Distance      : %f\n", dist->distance_naive);
-  if (use_jc) {
-    printf("Naive Dist. (JC)    : %f\n", dist->distance_naive_jc);
-  }
 }
 
 static void print_usage(void) {
@@ -743,12 +549,11 @@ static void print_usage(void) {
          "         -m: minimum k-mer count filter (used with -r, default: 2)\n"
          "         -o: output file path (required with -r; optional for single "
          "input)\n"
-         "  dist   [-j] <sketch|fasta1> <sketch|fasta2>\n"
-         "  three  [-j] <ref> <query1> <query2>\n"
-         "  triangle [-j] <sketch|fasta1> ... <sketch|fastaN>\n"
-         "         -j: use Jukes-Cantor distance correction\n"
+         "  dist   <sketch|fasta1> <sketch|fasta2>\n"
+         "  three  <ref> <query1> <query2>\n"
+         "  triangle <sketch|fasta1> ... <sketch|fastaN>\n"
          "  dup    [-k K] [-s S] [-w win] [-b min_bases] [-d identity] [-y "
-         "min_copy] [-j] "
+         "min_copy] "
          "fasta1 [fasta2 ...]\n"
          "  info   <sketch>\n"
          "\n");
@@ -784,7 +589,7 @@ static void sketch_worker_kt(void *data, long i, int _unused) {
     HashPool pool;
     pool_init(&pool, job->hash_threshold);
     parabola_stream(job->in_file, &p, &pool, job->min_count, NULL, 0);
-    pool_finalize(&pool, &sk.hashes, &sk.simplicities, &sk.sketch_size);
+    pool_finalize(&pool, &sk.hashes, &sk.sketch_size);
   }
 
   job->result = parabola_sketch_save(&sk, job->out_file);
@@ -794,17 +599,13 @@ static void sketch_worker_kt(void *data, long i, int _unused) {
 // ==============================================================
 // CMD
 // ==============================================================
-static int setup_dist_cmds(int argc, char **argv, int min_files, int *use_jc,
+static int setup_dist_cmds(int argc, char **argv, int min_files,
                            ParabolaSketch **sk, int **ready) {
   ketopt_t opt = KETOPT_INIT;
   int c;
-  *use_jc = 0;
 
-  while ((c = ketopt(&opt, argc - 1, argv + 1, 1, "j", 0)) >= 0) {
-    if (c == 'j')
-      *use_jc = 1;
-    else
-      return -1; // unknown or error
+  while ((c = ketopt(&opt, argc - 1, argv + 1, 1, "", 0)) >= 0) {
+    return -1; // unknown or error
   }
 
   int num_files = argc - (opt.ind + 1);
@@ -893,15 +694,14 @@ int cmd_sketch(int argc, char **argv) {
 }
 
 int cmd_dist(int argc, char **argv) {
-  int use_jc;
   ParabolaSketch *sk;
   int *ready;
 
-  if (setup_dist_cmds(argc, argv, 2, &use_jc, &sk, &ready) < 2)
+  if (setup_dist_cmds(argc, argv, 2, &sk, &ready) < 2)
     return 1;
 
   ParabolaDistResult dist = parabola_dist(&sk[0], &sk[1]);
-  print_distance_report(&sk[0], &sk[1], &dist, use_jc);
+  print_distance_report(&sk[0], &sk[1], &dist);
 
   free_ready_sketches(sk, ready, 2);
   free(sk);
@@ -910,19 +710,18 @@ int cmd_dist(int argc, char **argv) {
 }
 
 int cmd_three(int argc, char **argv) {
-  int use_jc;
   ParabolaSketch *sk;
   int *ready;
 
-  if (setup_dist_cmds(argc, argv, 3, &use_jc, &sk, &ready) < 3)
+  if (setup_dist_cmds(argc, argv, 3, &sk, &ready) < 3)
     return 1;
 
   ParabolaTripleDistResult tri = parabola_dist_three(&sk[0], &sk[1], &sk[2]);
-  print_distance_report(&sk[0], &sk[1], &tri.d01, use_jc);
+  print_distance_report(&sk[0], &sk[1], &tri.d01);
   printf("\n");
-  print_distance_report(&sk[0], &sk[2], &tri.d02, use_jc);
+  print_distance_report(&sk[0], &sk[2], &tri.d02);
   printf("\n");
-  print_distance_report(&sk[1], &sk[2], &tri.d12, use_jc);
+  print_distance_report(&sk[1], &sk[2], &tri.d12);
 
   free_ready_sketches(sk, ready, 3);
   free(sk);
@@ -984,7 +783,7 @@ static int dup_stream(const char *filename, const Parabola *p,
       pool_init(&pool, sk->hash_threshold);
       extract_and_insert(p, &pool, (const uint8_t *)ks->seq.s + i, chunk_len, 0,
                          NULL, 0);
-      pool_finalize(&pool, &sk->hashes, &sk->simplicities, &sk->sketch_size);
+      pool_finalize(&pool, &sk->hashes, &sk->sketch_size);
 
       if (sk->sketch_size > 0) {
         (*num_sketches)++;
@@ -1006,7 +805,6 @@ typedef struct {
   int *notcopy_count;
   double L;
   double H;
-  int use_jc;
 } DupWorkerData;
 
 static void dup_dist_worker(void *data, long i, int _unused) {
@@ -1017,7 +815,7 @@ static void dup_dist_worker(void *data, long i, int _unused) {
         !__atomic_load_n(&wd->is_dup[j], __ATOMIC_RELAXED))
       continue;
     ParabolaDistResult d = parabola_dist(&wd->sketches[i], &wd->sketches[j]);
-    double dist = wd->use_jc ? d.distance_jc : d.distance;
+    double dist = d.distance;
     if (dist >= wd->L && dist <= wd->H) {
       __atomic_store_n(&wd->is_dup[i], 0, __ATOMIC_RELAXED);
       __atomic_store_n(&wd->is_dup[j], 0, __ATOMIC_RELAXED);
@@ -1040,12 +838,11 @@ int cmd_dup(int argc, char **argv) {
   size_t window_size = 10000;
   size_t min_bases = 1000;
   double identity_th = 0.8;
-  int use_jc = 0;
   int min_copy = 3;
 
   ketopt_t opt = KETOPT_INIT;
   int c;
-  while ((c = ketopt(&opt, argc - 1, argv + 1, 1, "k:s:e:w:b:d:y:j", 0)) >= 0) {
+  while ((c = ketopt(&opt, argc - 1, argv + 1, 1, "k:s:e:w:b:d:y:", 0)) >= 0) {
     if (c == 'k')
       def.kmer_size = (uint32_t)atoi(opt.arg);
     else if (c == 's')
@@ -1060,8 +857,6 @@ int cmd_dup(int argc, char **argv) {
       identity_th = atof(opt.arg);
     else if (c == 'y')
       min_copy = atoi(opt.arg);
-    else if (c == 'j')
-      use_jc = 1;
     else
       return 1;
   }
@@ -1115,7 +910,7 @@ int cmd_dup(int argc, char **argv) {
   int n_threads =
       def.num_threads > 1 ? def.num_threads : 8; // Default to 8 threads for dup
   DupWorkerData wd = {sketches,      is_dup, copy_count, copy_indices,
-                      notcopy_count, L,      H,          use_jc};
+                      notcopy_count, L,      H};
   kt_for(n_threads, dup_dist_worker, &wd, num_sketches);
 
   FILE *dup_fp = fopen("dup.txt", "w");
@@ -1156,11 +951,10 @@ int cmd_dup(int argc, char **argv) {
 }
 
 int cmd_triangle(int argc, char **argv) {
-  int use_jc;
   ParabolaSketch *sk;
   int *ready;
 
-  int n = setup_dist_cmds(argc, argv, 1, &use_jc, &sk, &ready);
+  int n = setup_dist_cmds(argc, argv, 1, &sk, &ready);
   if (n < 1)
     return 1;
 
@@ -1169,12 +963,7 @@ int cmd_triangle(int argc, char **argv) {
     printf("%s", sk[i].name ? sk[i].name : "N/A");
     for (int j = 0; j < i; j++) {
       ParabolaDistResult d = parabola_dist(&sk[i], &sk[j]);
-      if (use_jc) {
-        printf("\t%f,%f,%f,%f", d.distance, d.distance_jc, d.distance_naive,
-               d.distance_naive_jc);
-      } else {
-        printf("\t%f,%f", d.distance, d.distance_naive);
-      }
+      printf("\t%f", d.distance);
     }
     printf("\n");
   }
