@@ -34,12 +34,6 @@ typedef struct {
   size_t shared_hashes;
 } ReverbDistResult;
 
-typedef struct {
-  ReverbDistResult d01;
-  ReverbDistResult d02;
-  ReverbDistResult d12;
-} ReverbTripleDistResult;
-
 /* Inverted hash index entry: maps a hash value to its source window */
 typedef struct {
   uint64_t hash;
@@ -71,16 +65,9 @@ typedef struct {
 } ReverbDupRegion;
 
 void reverb_init(Reverb *r, size_t hash_window);
-void kt_for(int n_threads, void (*func)(void *, long, int), void *data, long n);
 void reverb_sketch_free(ReverbSketch *sk);
 ReverbDistResult reverb_dist(const ReverbSketch *ref,
                              const ReverbSketch *query);
-ReverbTripleDistResult reverb_dist_three(const ReverbSketch *ref,
-                                         const ReverbSketch *q1,
-                                         const ReverbSketch *q2);
-void reverb_info(const ReverbSketch *sk);
-int reverb_sketch_save(const ReverbSketch *sk, const char *filepath);
-int reverb_sketch_load(ReverbSketch *sk, const char *filepath);
 
 /* Union-Find operations */
 void uf_init(UnionFind *uf, size_t n);
