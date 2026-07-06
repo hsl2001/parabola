@@ -1153,9 +1153,9 @@ int cmd_dup(int argc, char **argv) {
   size_t window_size = 10000;
   size_t step_size = 0; /* 0 = auto (window/2) */
   size_t min_bases = 1000;
-  double max_dist = 0.2;
+  double max_dist = 0.05;
   int min_copy = 2;
-  int max_copy = 0; /* 0 = unlimited */
+  int max_copy = 50; /* 0 = unlimited */
   const char *out_prefix = "reverb";
   int n_threads = 8;
 
