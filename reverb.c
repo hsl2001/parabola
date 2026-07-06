@@ -590,17 +590,17 @@ static void print_usage(void) {
       "Commands:\n"
       "  help | -h | --help\n"
       "  dup    [-k K] [-s S] [-w win] [-t step] [-b min_bases] [-d max_dist]\n"
-      "         [-y min_copy] [-m max_degree] [-o prefix] [-p threads] fasta1 "
+      "         [-m min_copy] [-M max_copy] [-o prefix] [-p threads] fasta1 "
       "[fasta2 ...]\n"
       "         -k: kmer size (default: 21, max: 42)\n"
       "         -s: scale factor (default: 10)\n"
       "         -w: window size in bp (default: 10000)\n"
       "         -t: step size in bp (default: window/2)\n"
       "         -b: minimum valid bases per window (default: 1000)\n"
-      "         -d: maximum distance to consider as copy (default: 0.05)\n"
-      "         -y: minimum copy count (default: 2)\n"
-      "         -m: max connected components to filter ubiquitous repeats "
-      "(default: 50)\n"
+      "         -d: maximum distance to consider as copy (default: 0.2)\n"
+      "         -m: minimum copy count (default: 2)\n"
+      "         -M: maximum copy count to filter ubiquitous repeats (default: "
+      "unlimited)\n"
       "         -o: output file prefix (default: reverb)\n"
       "         -p: number of threads (default: 8)\n"
       "  sketch [-k K] [-s S] [-e E] [-p threads] [-r] [-m min_count] "
@@ -974,7 +974,7 @@ static int cmp_candidate_pair(const void *a, const void *b) {
  * on the same chromosome. */
 static size_t build_candidate_edges(ReverbSketch *sketches, WindowCoord *coords,
                                     size_t n_windows, double max_dist,
-                                    size_t step_size,
+                                    size_t window_size,
                                     ReverbDupEdge **out_edges) {
 
   /* 1. Flatten all (hash, window_id) entries */
@@ -1074,7 +1074,7 @@ static size_t build_candidate_edges(ReverbSketch *sketches, WindowCoord *coords,
       size_t dist_bp = (coords[a].start < coords[b].start)
                            ? coords[b].start - coords[a].start
                            : coords[a].start - coords[b].start;
-      if (dist_bp < step_size)
+      if (dist_bp < window_size)
         continue;
     }
 
@@ -1153,16 +1153,16 @@ int cmd_dup(int argc, char **argv) {
   size_t window_size = 10000;
   size_t step_size = 0; /* 0 = auto (window/2) */
   size_t min_bases = 1000;
-  double max_dist = 0.05;
+  double max_dist = 0.2;
   int min_copy = 2;
-  uint32_t max_degree = 20;
+  int max_copy = 0; /* 0 = unlimited */
   const char *out_prefix = "reverb";
   int n_threads = 8;
 
   ketopt_t opt = KETOPT_INIT;
   int c;
   while ((c = ketopt(&opt, argc - 1, argv + 1, 1,
-                     "k:s:e:w:t:b:d:y:m:o:p:", 0)) >= 0) {
+                     "k:s:e:w:t:b:d:m:M:o:p:", 0)) >= 0) {
     if (c == 'k')
       def.kmer_size = (uint32_t)atoi(opt.arg);
     else if (c == 's')
@@ -1177,10 +1177,10 @@ int cmd_dup(int argc, char **argv) {
       min_bases = (size_t)strtoull(opt.arg, NULL, 10);
     else if (c == 'd')
       max_dist = atof(opt.arg);
-    else if (c == 'y')
-      min_copy = atoi(opt.arg);
     else if (c == 'm')
-      max_degree = (uint32_t)atoi(opt.arg);
+      min_copy = atoi(opt.arg);
+    else if (c == 'M')
+      max_copy = atoi(opt.arg);
     else if (c == 'o')
       out_prefix = opt.arg;
     else if (c == 'p')
@@ -1242,7 +1242,7 @@ int cmd_dup(int argc, char **argv) {
   fprintf(stderr, "[reverb] Building hash index and finding candidates ...\n");
   ReverbDupEdge *edges = NULL;
   size_t n_edges = build_candidate_edges(sketches, coords, num_sketches,
-                                         max_dist, step_size, &edges);
+                                         max_dist, window_size, &edges);
   fprintf(stderr, "[reverb] Duplicated edges: %zu\n", n_edges);
 
   if (n_edges == 0) {
@@ -1251,31 +1251,12 @@ int cmd_dup(int argc, char **argv) {
   }
 
   /* Phase 3: Union-Find clustering */
-  fprintf(stderr, "[reverb] Clustering SD families (max_degree=%u) ...\n",
-          max_degree);
+  fprintf(stderr, "[reverb] Clustering SD families ...\n");
   UnionFind uf;
   uf_init(&uf, num_sketches);
 
-  uint32_t *degree = calloc(num_sketches, sizeof(uint32_t));
   for (size_t i = 0; i < n_edges; i++) {
-    degree[edges[i].win_a]++;
-    degree[edges[i].win_b]++;
-  }
-
-  size_t dropped_edges = 0;
-  for (size_t i = 0; i < n_edges; i++) {
-    if (degree[edges[i].win_a] <= max_degree &&
-        degree[edges[i].win_b] <= max_degree) {
-      uf_union(&uf, edges[i].win_a, edges[i].win_b);
-    } else {
-      dropped_edges++;
-    }
-  }
-  if (dropped_edges > 0) {
-    fprintf(stderr,
-            "[reverb] Dropped %zu edges connecting ubiquitous repeats (degree "
-            "> %u)\n",
-            dropped_edges, max_degree);
+    uf_union(&uf, edges[i].win_a, edges[i].win_b);
   }
 
   /* Count component sizes */
@@ -1303,7 +1284,7 @@ int cmd_dup(int argc, char **argv) {
     uint32_t cc = comp_size[fam];
     if ((int)cc < min_copy)
       continue;
-    if (degree[a] > max_degree || degree[b] > max_degree)
+    if (max_copy > 0 && (int)cc > max_copy)
       continue;
 
     fprintf(bedpe_fp, "%s\t%zu\t%zu\t%s\t%zu\t%zu\tSD_%u\t%.6f\t%u\n",
@@ -1332,6 +1313,8 @@ int cmd_dup(int argc, char **argv) {
   for (size_t i = 0; i < num_sketches; i++) {
     uint32_t fam = uf_find(&uf, (uint32_t)i);
     if ((int)comp_size[fam] < min_copy)
+      continue;
+    if (max_copy > 0 && (int)comp_size[fam] > max_copy)
       continue;
 
     if (n_dup_regions >= cap_dup_regions) {
