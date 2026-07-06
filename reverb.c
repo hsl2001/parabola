@@ -1259,52 +1259,12 @@ int cmd_dup(int argc, char **argv) {
     uf_union(&uf, edges[i].win_a, edges[i].win_b);
   }
 
-  /* Count component sizes */
+  /* Count component sizes (pre-merge) */
   uint32_t *comp_size = calloc(num_sketches, sizeof(uint32_t));
   for (size_t i = 0; i < num_sketches; i++)
     comp_size[uf_find(&uf, (uint32_t)i)]++;
 
-  /* Phase 4: Write BEDPE output (pairs) */
-  snprintf(path_buf, sizeof(path_buf), "%s.dup.bedpe", out_prefix);
-  FILE *bedpe_fp = fopen(path_buf, "w");
-  if (!bedpe_fp) {
-    fprintf(stderr, "Error: cannot open %s\n", path_buf);
-    uf_free(&uf);
-    free(comp_size);
-    goto cleanup;
-  }
-
-  fprintf(bedpe_fp, "#chrom1\tstart1\tend1\tchrom2\tstart2\tend2\tfamily\tdista"
-                    "nce\tcopy_count\n");
-  size_t reported_edges = 0;
-  for (size_t i = 0; i < n_edges; i++) {
-    uint32_t a = edges[i].win_a;
-    uint32_t b = edges[i].win_b;
-    uint32_t fam = uf_find(&uf, a);
-    uint32_t cc = comp_size[fam];
-    if ((int)cc < min_copy)
-      continue;
-    if (max_copy > 0 && (int)cc > max_copy)
-      continue;
-
-    fprintf(bedpe_fp, "%s\t%zu\t%zu\t%s\t%zu\t%zu\tSD_%u\t%.6f\t%u\n",
-            coords[a].chrom, coords[a].start, coords[a].end, coords[b].chrom,
-            coords[b].start, coords[b].end, fam, edges[i].distance, cc);
-    reported_edges++;
-  }
-  fclose(bedpe_fp);
-
-  /* Phase 5: Build merged BED regions */
-  snprintf(path_buf, sizeof(path_buf), "%s.dup.bed", out_prefix);
-  FILE *dup_bed_fp = fopen(path_buf, "w");
-  if (!dup_bed_fp) {
-    fprintf(stderr, "Error: cannot open %s\n", path_buf);
-    uf_free(&uf);
-    free(comp_size);
-    goto cleanup;
-  }
-
-  /* Collect all windows that belong to families >= min_copy */
+  /* Collect all windows that belong to families (unfiltered) */
   size_t n_dup_regions = 0;
   size_t cap_dup_regions = 256;
   ReverbDupRegion *dup_regions =
@@ -1312,9 +1272,7 @@ int cmd_dup(int argc, char **argv) {
 
   for (size_t i = 0; i < num_sketches; i++) {
     uint32_t fam = uf_find(&uf, (uint32_t)i);
-    if ((int)comp_size[fam] < min_copy)
-      continue;
-    if (max_copy > 0 && (int)comp_size[fam] > max_copy)
+    if (comp_size[fam] < 2)
       continue;
 
     if (n_dup_regions >= cap_dup_regions) {
@@ -1333,10 +1291,71 @@ int cmd_dup(int argc, char **argv) {
 
   size_t n_merged = merge_dup_regions(dup_regions, n_dup_regions);
 
+  /* Recount per-family copy counts after merge */
+  uint32_t *post_merge_comp_size = calloc(num_sketches, sizeof(uint32_t));
+  for (size_t i = 0; i < n_merged; i++) {
+    uint32_t fam = dup_regions[i].family_id;
+    post_merge_comp_size[fam]++;
+  }
+
+  /* Update copy counts in dup_regions */
+  for (size_t i = 0; i < n_merged; i++) {
+    dup_regions[i].copy_count = post_merge_comp_size[dup_regions[i].family_id];
+  }
+
+  /* Phase 4: Write BEDPE output (pairs) */
+  snprintf(path_buf, sizeof(path_buf), "%s.dup.bedpe", out_prefix);
+  FILE *bedpe_fp = fopen(path_buf, "w");
+  if (!bedpe_fp) {
+    fprintf(stderr, "Error: cannot open %s\n", path_buf);
+    uf_free(&uf);
+    free(comp_size);
+    free(post_merge_comp_size);
+    free(dup_regions);
+    goto cleanup;
+  }
+
+  fprintf(bedpe_fp, "#chrom1\tstart1\tend1\tchrom2\tstart2\tend2\tfamily\tdista"
+                    "nce\tcopy_count\n");
+  size_t reported_edges = 0;
+  for (size_t i = 0; i < n_edges; i++) {
+    uint32_t a = edges[i].win_a;
+    uint32_t b = edges[i].win_b;
+    uint32_t fam = uf_find(&uf, a);
+    uint32_t cc = post_merge_comp_size[fam];
+    if ((int)cc < min_copy)
+      continue;
+    if (max_copy > 0 && (int)cc > max_copy)
+      continue;
+
+    fprintf(bedpe_fp, "%s\t%zu\t%zu\t%s\t%zu\t%zu\tSD_%u\t%.6f\t%u\n",
+            coords[a].chrom, coords[a].start, coords[a].end, coords[b].chrom,
+            coords[b].start, coords[b].end, fam, edges[i].distance, cc);
+    reported_edges++;
+  }
+  fclose(bedpe_fp);
+
+  /* Phase 5: Write BED output */
+  snprintf(path_buf, sizeof(path_buf), "%s.dup.bed", out_prefix);
+  FILE *dup_bed_fp = fopen(path_buf, "w");
+  if (!dup_bed_fp) {
+    fprintf(stderr, "Error: cannot open %s\n", path_buf);
+    uf_free(&uf);
+    free(comp_size);
+    free(post_merge_comp_size);
+    free(dup_regions);
+    goto cleanup;
+  }
+
   fprintf(dup_bed_fp, "#chrom\tstart\tend\tfamily\tcopy_count\n");
   size_t n_families = 0;
   uint32_t last_fam = UINT32_MAX;
+  size_t n_output = 0;
   for (size_t i = 0; i < n_merged; i++) {
+    if ((int)dup_regions[i].copy_count < min_copy)
+      continue;
+    if (max_copy > 0 && (int)dup_regions[i].copy_count > max_copy)
+      continue;
     fprintf(dup_bed_fp, "%s\t%zu\t%zu\tSD_%u\t%u\n", dup_regions[i].chrom,
             dup_regions[i].start, dup_regions[i].end, dup_regions[i].family_id,
             dup_regions[i].copy_count);
@@ -1344,8 +1363,12 @@ int cmd_dup(int argc, char **argv) {
       n_families++;
       last_fam = dup_regions[i].family_id;
     }
+    n_output++;
   }
   fclose(dup_bed_fp);
+  n_merged = n_output;
+
+  free(post_merge_comp_size);
 
   clock_gettime(CLOCK_MONOTONIC, &t_end);
   double elapsed =
