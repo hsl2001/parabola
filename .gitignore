@@ -1,5 +1,5 @@
 .idea/
 .venv/
 parabola
-tmp_*
+tmp*
 *.fasta

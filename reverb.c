@@ -10,11 +10,22 @@
 #define MIX_CONST1 0xff51afd7ed558ccdULL
 #define MIX_CONST2 0xc4ceb9fe1a85ec53ULL
 
+/* Generic dynamic-array push: grows `arr` by doubling `cap` as needed. */
+#define DA_PUSH(arr, n, cap, val)                                              \
+  do {                                                                         \
+    if ((n) >= (cap)) {                                                        \
+      (cap) = (cap) ? (cap) * 2 : 64;                                          \
+      (arr) = realloc((arr), (cap) * sizeof(*(arr)));                          \
+    }                                                                          \
+    (arr)[(n)++] = (val);                                                      \
+  } while (0)
+
 KSEQ_INIT(gzFile, gzread)
 
 // ==============================================================
 // UTILITIES
 // ==============================================================
+
 /* Reverb encoding: A = 001, C = 110, G = 011, T = 100 */
 static const int8_t BASE_LOOKUP[256] = {
     -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
@@ -36,8 +47,6 @@ static uint64_t mix_hash(__uint128_t hash_value, uint64_t seed) {
   __uint128_t p = (hash_value ^ MIX_CONST1) * ((__uint128_t)seed ^ MIX_CONST2);
   return (uint64_t)(p ^ (p >> 64));
 }
-
-static size_t min_size_t(size_t a, size_t b) { return a < b ? a : b; }
 
 static uint64_t reverse_bits64(uint64_t n) {
 #if defined(__aarch64__)
@@ -61,8 +70,9 @@ static __uint128_t reverse_bits128(__uint128_t n) {
 // ==============================================================
 // INIT
 // ==============================================================
+
 void reverb_init(Reverb *r, size_t hash_window) {
-  size_t k = min_size_t(hash_window, 42); /* 3*42 = 126 bits fits __uint128_t */
+  size_t k = hash_window < 42 ? hash_window : 42; /* 3*42=126 bits ≤ 128 */
   uint32_t kmer_bits = 3 * (uint32_t)k;
 
   __uint128_t remover_mask =
@@ -79,7 +89,7 @@ void reverb_init(Reverb *r, size_t hash_window) {
 }
 
 // ==============================================================
-// HASH POOL (OVERFLOWING BUFFER)
+// HASH POOL
 // ==============================================================
 
 typedef struct {
@@ -96,24 +106,13 @@ static int cmp_uint64(const void *a, const void *b) {
 }
 
 static void pool_init(HashPool *pool, uint64_t threshold) {
-  pool->size = 0;
-  pool->cap = 0;
-  pool->hash_threshold = threshold;
-  pool->hashes = NULL;
+  *pool = (HashPool){.hash_threshold = threshold};
 }
 
 static void pool_try_insert(HashPool *pool, uint64_t h) {
   if (h >= pool->hash_threshold)
     return;
-  if (pool->size == pool->cap) {
-    size_t nc = pool->cap ? pool->cap * 2 : 64;
-    uint64_t *nh = realloc(pool->hashes, nc * sizeof(uint64_t));
-    if (!nh)
-      return;
-    pool->hashes = nh;
-    pool->cap = nc;
-  }
-  pool->hashes[pool->size++] = h;
+  DA_PUSH(pool->hashes, pool->size, pool->cap, h);
 }
 
 static void pool_finalize(HashPool *pool, uint64_t **out_hashes,
@@ -121,11 +120,11 @@ static void pool_finalize(HashPool *pool, uint64_t **out_hashes,
   size_t n = pool->size;
   if (n) {
     qsort(pool->hashes, n, sizeof(uint64_t), cmp_uint64);
+    /* Deduplicate in-place */
     size_t u = 0;
     for (size_t i = 0; i < n; i++) {
-      if (u == 0 || pool->hashes[i] != pool->hashes[u - 1]) {
+      if (u == 0 || pool->hashes[i] != pool->hashes[u - 1])
         pool->hashes[u++] = pool->hashes[i];
-      }
     }
     n = u;
     uint64_t *nh = realloc(pool->hashes, n * sizeof(uint64_t));
@@ -141,6 +140,32 @@ static void pool_finalize(HashPool *pool, uint64_t **out_hashes,
 // ==============================================================
 // SKETCH EXTRACTION
 // ==============================================================
+
+/* Count-Min Sketch filter: returns 1 if hash passes the threshold. */
+static inline int cms_check_and_increment(uint64_t h, int min_count,
+                                          uint8_t *cms_table, size_t cms_mask) {
+  uint64_t k1 = h, k2 = h * MIX_CONST1, k3 = h * MIX_CONST2;
+  size_t h1 = (size_t)((k1 ^ (k1 >> 32)) & cms_mask);
+  size_t h2 = (size_t)((k2 ^ (k2 >> 32)) & cms_mask);
+  size_t h3 = (size_t)((k3 ^ (k3 >> 32)) & cms_mask);
+
+  uint8_t c1 = cms_table[h1], c2 = cms_table[h2], c3 = cms_table[h3];
+  uint8_t min_c = (c1 < c2) ? ((c1 < c3) ? c1 : c3) : ((c2 < c3) ? c2 : c3);
+  uint8_t thr = (uint8_t)(min_count > (int)UINT8_MAX ? UINT8_MAX : min_count);
+
+  if (min_c >= thr)
+    return 0; /* already saturated — skip duplicate insert */
+
+  if (c1 == min_c && c1 < UINT8_MAX)
+    cms_table[h1]++;
+  if (c2 == min_c && c2 < UINT8_MAX)
+    cms_table[h2]++;
+  if (c3 == min_c && c3 < UINT8_MAX)
+    cms_table[h3]++;
+
+  return (uint8_t)(min_c + 1) == thr; /* 1 = just reached threshold */
+}
+
 __attribute__((hot)) static void
 extract_and_insert(const Reverb *r, HashPool *pool, const uint8_t *seq,
                    size_t len, int min_count, uint8_t *cms_table,
@@ -160,68 +185,21 @@ extract_and_insert(const Reverb *r, HashPool *pool, const uint8_t *seq,
     fwd = ((fwd & r->remover_mask) << 3) | (uint8_t)lv;
     if (valid < K)
       valid++;
-
-    if (valid >= K) {
-      __uint128_t rev = reverse_bits128(fwd) >> r->rc_shift;
-      __uint128_t canon = fwd < rev ? fwd : rev;
-      uint64_t h = mix_hash(canon, r->hash_seed);
-
-      if (h >= pool->hash_threshold)
-        continue;
-
-      if (min_count > 1 && cms_table) {
-        uint64_t k1 = h, k2 = h * MIX_CONST1, k3 = h * MIX_CONST2;
-        size_t h1 = (size_t)((k1 ^ (k1 >> 32)) & cms_mask);
-        size_t h2 = (size_t)((k2 ^ (k2 >> 32)) & cms_mask);
-        size_t h3 = (size_t)((k3 ^ (k3 >> 32)) & cms_mask);
-
-        uint8_t c1 = cms_table[h1], c2 = cms_table[h2], c3 = cms_table[h3];
-        uint8_t min_c =
-            (c1 < c2) ? ((c1 < c3) ? c1 : c3) : ((c2 < c3) ? c2 : c3);
-        uint8_t thr =
-            (uint8_t)(min_count > (int)UINT8_MAX ? UINT8_MAX : min_count);
-
-        if (min_c < thr) {
-          if (c1 == min_c && c1 < UINT8_MAX)
-            cms_table[h1]++;
-          if (c2 == min_c && c2 < UINT8_MAX)
-            cms_table[h2]++;
-          if (c3 == min_c && c3 < UINT8_MAX)
-            cms_table[h3]++;
-          if ((uint8_t)(min_c + 1) != thr)
-            continue;
-        } else {
-          continue;
-        }
-      }
-
-      pool_try_insert(pool, h);
-    }
-  }
-}
-
-// ==============================================================
-// FILE STREAMING
-// ==============================================================
-void reverb_stream(const char *filename, const Reverb *r, HashPool *pool,
-                   int min_count, uint8_t *cms_table, size_t cms_mask) {
-  gzFile fp = gzopen(filename, "r");
-  if (!fp)
-    return;
-  kseq_t *ks = kseq_init(fp);
-  if (!ks) {
-    gzclose(fp);
-    return;
-  }
-
-  while (kseq_read(ks) >= 0) {
-    if (ks->seq.l < r->hash_window)
+    if (valid < K)
       continue;
-    extract_and_insert(r, pool, (const uint8_t *)ks->seq.s, ks->seq.l,
-                       min_count, cms_table, cms_mask);
+
+    __uint128_t rev = reverse_bits128(fwd) >> r->rc_shift;
+    __uint128_t canon = fwd < rev ? fwd : rev;
+    uint64_t h = mix_hash(canon, r->hash_seed);
+
+    if (h >= pool->hash_threshold)
+      continue;
+    if (min_count > 1 && cms_table &&
+        !cms_check_and_increment(h, min_count, cms_table, cms_mask))
+      continue;
+
+    pool_try_insert(pool, h);
   }
-  kseq_destroy(ks);
-  gzclose(fp);
 }
 
 void reverb_sketch_free(ReverbSketch *sk) {
@@ -234,6 +212,7 @@ void reverb_sketch_free(ReverbSketch *sk) {
 // ==============================================================
 // DISTANCE CALCULATION
 // ==============================================================
+
 ReverbDistResult reverb_dist(const ReverbSketch *ref,
                              const ReverbSketch *query) {
   ReverbDistResult res = {0.0, 1.0, 0};
@@ -263,6 +242,10 @@ ReverbDistResult reverb_dist(const ReverbSketch *ref,
   return res;
 }
 
+// ==============================================================
+// UNION-FIND
+// ==============================================================
+
 void uf_init(UnionFind *uf, size_t n) {
   uf->n = n;
   uf->parent = (uint32_t *)malloc(n * sizeof(uint32_t));
@@ -273,7 +256,7 @@ void uf_init(UnionFind *uf, size_t n) {
 
 uint32_t uf_find(UnionFind *uf, uint32_t x) {
   while (uf->parent[x] != x) {
-    uf->parent[x] = uf->parent[uf->parent[x]]; /* path compression */
+    uf->parent[x] = uf->parent[uf->parent[x]]; /* path splitting */
     x = uf->parent[x];
   }
   return x;
@@ -302,6 +285,7 @@ void uf_free(UnionFind *uf) {
 // ==============================================================
 // PARAMETERS
 // ==============================================================
+
 typedef struct {
   uint32_t kmer_size;
   uint64_t scale;
@@ -335,12 +319,17 @@ static void print_usage(void) {
 // DUP: WINDOW STREAMING
 // ==============================================================
 
-/* Window metadata for tracking genomic coordinates */
 typedef struct {
   char *chrom;
   size_t start;
   size_t end;
 } WindowCoord;
+
+/* Inverted hash index entry: maps a hash value to its source window */
+typedef struct {
+  uint64_t hash;
+  uint32_t window_id;
+} HashWindowEntry;
 
 static int dup_stream(const char *filename, const Reverb *r,
                       SketchBuildParams *params, size_t window_size,
@@ -360,17 +349,16 @@ static int dup_stream(const char *filename, const Reverb *r,
   while (kseq_read(ks) >= 0) {
     size_t len = ks->seq.l;
     for (size_t i = 0; i + window_size <= len; i += step_size) {
-      size_t chunk_len = window_size;
-
+      /* Count valid bases in this window */
       size_t valid_bases = 0;
-      for (size_t j = 0; j < chunk_len; j++) {
-        int8_t lv = BASE_LOOKUP[(uint8_t)ks->seq.s[i + j]];
-        if (lv >= 0)
+      for (size_t j = 0; j < window_size; j++) {
+        if (BASE_LOOKUP[(uint8_t)ks->seq.s[i + j]] >= 0)
           valid_bases++;
       }
       if (valid_bases < min_bases)
         continue;
 
+      /* Ensure capacity */
       if (*num_sketches >= *cap_sketches) {
         *cap_sketches = *cap_sketches == 0 ? 256 : *cap_sketches * 2;
         *sketches = realloc(*sketches, *cap_sketches * sizeof(ReverbSketch));
@@ -383,24 +371,23 @@ static int dup_stream(const char *filename, const Reverb *r,
 
       char namebuf[512];
       snprintf(namebuf, sizeof(namebuf), "%s_%zu_%zu", ks->name.s, i,
-               i + chunk_len);
+               i + window_size);
       sk->name = strdup(namebuf);
       sk->kmer_size = r->hash_window;
       sk->hash_threshold = UINT64_MAX / params->scale;
 
       wc->chrom = strdup(ks->name.s);
       wc->start = i;
-      wc->end = i + chunk_len;
+      wc->end = i + window_size;
 
-      if (bed_fp) {
-        fprintf(bed_fp, "%s\t%zu\t%zu\t%s\n", ks->name.s, i, i + chunk_len,
+      if (bed_fp)
+        fprintf(bed_fp, "%s\t%zu\t%zu\t%s\n", ks->name.s, i, i + window_size,
                 sk->name);
-      }
 
       HashPool pool;
       pool_init(&pool, sk->hash_threshold);
-      extract_and_insert(r, &pool, (const uint8_t *)ks->seq.s + i, chunk_len, 0,
-                         NULL, 0);
+      extract_and_insert(r, &pool, (const uint8_t *)ks->seq.s + i, window_size,
+                         0, NULL, 0);
       pool_finalize(&pool, &sk->hashes, &sk->sketch_size);
 
       if (sk->sketch_size > 0) {
@@ -408,21 +395,6 @@ static int dup_stream(const char *filename, const Reverb *r,
       } else {
         free(sk->name);
         free(wc->chrom);
-      }
-    }
-
-    /* Handle trailing region if it's large enough */
-    size_t last_start =
-        (len >= window_size)
-            ? ((len - window_size) / step_size) * step_size + step_size
-            : 0;
-    if (last_start + window_size <= len)
-      ; /* already covered */
-    else if (len > window_size && last_start < len - window_size + step_size) {
-      /* trailing chunk: last window_size bases of the contig */
-      size_t trail_start = len - window_size;
-      if (trail_start > 0 && trail_start != last_start - step_size) {
-        /* skip if it overlaps too much with the previous window */
       }
     }
   }
@@ -438,18 +410,11 @@ static int dup_stream(const char *filename, const Reverb *r,
 static int cmp_hash_window_entry(const void *a, const void *b) {
   const HashWindowEntry *ea = (const HashWindowEntry *)a;
   const HashWindowEntry *eb = (const HashWindowEntry *)b;
-  if (ea->hash < eb->hash)
-    return -1;
-  if (ea->hash > eb->hash)
-    return 1;
-  if (ea->window_id < eb->window_id)
-    return -1;
-  if (ea->window_id > eb->window_id)
-    return 1;
-  return 0;
+  if (ea->hash != eb->hash)
+    return (ea->hash > eb->hash) - (ea->hash < eb->hash);
+  return (ea->window_id > eb->window_id) - (ea->window_id < eb->window_id);
 }
 
-/* A candidate pair with accumulated shared hash count */
 typedef struct {
   uint32_t win_a;
   uint32_t win_b;
@@ -473,7 +438,6 @@ static size_t build_candidate_edges(ReverbSketch *sketches, WindowCoord *coords,
                                     size_t n_windows, double max_dist,
                                     size_t window_size,
                                     ReverbDupEdge **out_edges) {
-
   /* 1. Flatten all (hash, window_id) entries */
   size_t total_entries = 0;
   for (size_t i = 0; i < n_windows; i++)
@@ -488,20 +452,16 @@ static size_t build_candidate_edges(ReverbSketch *sketches, WindowCoord *coords,
   size_t idx = 0;
   for (size_t i = 0; i < n_windows; i++) {
     for (size_t j = 0; j < sketches[i].sketch_size; j++) {
-      entries[idx].hash = sketches[i].hashes[j];
-      entries[idx].window_id = (uint32_t)i;
-      idx++;
+      entries[idx++] = (HashWindowEntry){.hash = sketches[i].hashes[j],
+                                         .window_id = (uint32_t)i};
     }
   }
 
   /* 2. Sort by hash value */
   qsort(entries, total_entries, sizeof(HashWindowEntry), cmp_hash_window_entry);
 
-  /* 3. For each group of entries with the same hash, collect window pairs.
-   *    Use a hash map approximation: accumulate (win_a, win_b) -> shared_count
-   *    via a sorted array of CandidatePairs. */
-  size_t n_candidates = 0;
-  size_t cap_candidates = 0;
+  /* 3. For each group sharing the same hash, emit (win_a, win_b) pairs */
+  size_t n_candidates = 0, cap_candidates = 0;
   CandidatePair *candidates = NULL;
 
   size_t run_start = 0;
@@ -512,7 +472,6 @@ static size_t build_candidate_edges(ReverbSketch *sketches, WindowCoord *coords,
       run_end++;
 
     size_t run_len = run_end - run_start;
-    /* Skip hashes that appear in too many windows (likely repetitive noise) */
     if (run_len >= 2 && run_len <= 100) {
       for (size_t i = run_start; i < run_end; i++) {
         for (size_t j = i + 1; j < run_end; j++) {
@@ -525,13 +484,8 @@ static size_t build_candidate_edges(ReverbSketch *sketches, WindowCoord *coords,
             a = b;
             b = t;
           }
-
-          if (n_candidates >= cap_candidates) {
-            cap_candidates = cap_candidates ? cap_candidates * 2 : 4096;
-            candidates =
-                realloc(candidates, cap_candidates * sizeof(CandidatePair));
-          }
-          candidates[n_candidates++] = (CandidatePair){a, b, 1};
+          DA_PUSH(candidates, n_candidates, cap_candidates,
+                  ((CandidatePair){a, b, 1}));
         }
       }
     }
@@ -544,7 +498,7 @@ static size_t build_candidate_edges(ReverbSketch *sketches, WindowCoord *coords,
     return 0;
   }
 
-  /* 4. Sort candidates and merge duplicates to get shared_count */
+  /* 4. Sort and merge duplicates to get shared_count */
   qsort(candidates, n_candidates, sizeof(CandidatePair), cmp_candidate_pair);
 
   size_t n_unique = 0;
@@ -558,9 +512,8 @@ static size_t build_candidate_edges(ReverbSketch *sketches, WindowCoord *coords,
   }
 
   /* 5. For pairs with enough shared hashes, compute full distance */
-  size_t n_edges = 0;
-  size_t cap_edges = 1024;
-  ReverbDupEdge *edges = malloc(cap_edges * sizeof(ReverbDupEdge));
+  size_t n_edges = 0, cap_edges = 0;
+  ReverbDupEdge *edges = NULL;
 
   for (size_t i = 0; i < n_unique; i++) {
     uint32_t a = candidates[i].win_a;
@@ -575,18 +528,12 @@ static size_t build_candidate_edges(ReverbSketch *sketches, WindowCoord *coords,
         continue;
     }
 
-    /* Require at least 2 shared hashes to proceed */
     if (candidates[i].shared_count < 2)
       continue;
 
     ReverbDistResult d = reverb_dist(&sketches[a], &sketches[b]);
-    if (d.distance < max_dist) {
-      if (n_edges >= cap_edges) {
-        cap_edges *= 2;
-        edges = realloc(edges, cap_edges * sizeof(ReverbDupEdge));
-      }
-      edges[n_edges++] = (ReverbDupEdge){a, b, d.distance};
-    }
+    if (d.distance < max_dist)
+      DA_PUSH(edges, n_edges, cap_edges, ((ReverbDupEdge){a, b, d.distance}));
   }
 
   free(candidates);
@@ -598,18 +545,13 @@ static size_t build_candidate_edges(ReverbSketch *sketches, WindowCoord *coords,
 // DUP: SEGMENT MERGE
 // ==============================================================
 
-/* Compare ReverbDupRegion by (chrom, start) for sorting */
 static int cmp_dup_region(const void *a, const void *b) {
   const ReverbDupRegion *ra = (const ReverbDupRegion *)a;
   const ReverbDupRegion *rb = (const ReverbDupRegion *)b;
   int c = strcmp(ra->chrom, rb->chrom);
   if (c != 0)
     return c;
-  if (ra->start < rb->start)
-    return -1;
-  if (ra->start > rb->start)
-    return 1;
-  return 0;
+  return (ra->start > rb->start) - (ra->start < rb->start);
 }
 
 /* Merge adjacent/overlapping regions in the same SD family.
@@ -625,34 +567,122 @@ static size_t merge_dup_regions(ReverbDupRegion *regions, size_t n) {
     if (regions[i].family_id == regions[out].family_id &&
         strcmp(regions[i].chrom, regions[out].chrom) == 0 &&
         regions[i].start <= regions[out].end) {
-      /* Merge: extend end, update avg distance */
       if (regions[i].end > regions[out].end)
         regions[out].end = regions[i].end;
       regions[out].avg_distance =
           (regions[out].avg_distance + regions[i].avg_distance) / 2.0;
     } else {
       out++;
-      if (out != i) {
+      if (out != i)
         regions[out] = regions[i];
-      }
     }
   }
   return out + 1;
 }
 
 // ==============================================================
-// CMD: DUP (core feature)
+// DUP: OUTPUT HELPERS
 // ==============================================================
+
+static size_t write_bedpe_output(const char *path, ReverbDupEdge *edges,
+                                 size_t n_edges, WindowCoord *coords,
+                                 UnionFind *uf, uint32_t *copy_counts,
+                                 char **hub_label, int min_copy, int max_copy) {
+  FILE *fp = fopen(path, "w");
+  if (!fp) {
+    fprintf(stderr, "Error: cannot open %s\n", path);
+    return 0;
+  }
+
+  fprintf(fp, "#chrom1\tstart1\tend1\tchrom2\tstart2\tend2\tfamily\t"
+              "distance\tcopy_count\n");
+  size_t reported = 0;
+  for (size_t i = 0; i < n_edges; i++) {
+    uint32_t a = edges[i].win_a, b = edges[i].win_b;
+    uint32_t fam = uf_find(uf, a);
+    uint32_t cc = copy_counts[fam];
+    if ((int)cc < min_copy || (max_copy > 0 && (int)cc > max_copy))
+      continue;
+    const char *label = hub_label[fam] ? hub_label[fam] : "unknown";
+    fprintf(fp, "%s\t%zu\t%zu\t%s\t%zu\t%zu\t%s\t%.6f\t%u\n", coords[a].chrom,
+            coords[a].start, coords[a].end, coords[b].chrom, coords[b].start,
+            coords[b].end, label, edges[i].distance, cc);
+    reported++;
+  }
+  fclose(fp);
+  return reported;
+}
+
+typedef struct {
+  size_t n_output;
+  size_t n_families;
+} BedOutputStats;
+
+static BedOutputStats write_bed_output(const char *path,
+                                       ReverbDupRegion *regions,
+                                       size_t n_merged, char **hub_label,
+                                       int min_copy, int max_copy) {
+  BedOutputStats stats = {0, 0};
+  FILE *fp = fopen(path, "w");
+  if (!fp) {
+    fprintf(stderr, "Error: cannot open %s\n", path);
+    return stats;
+  }
+
+  fprintf(fp, "#chrom\tstart\tend\tfamily\tcopy_count\n");
+  uint32_t last_fam = UINT32_MAX;
+  for (size_t i = 0; i < n_merged; i++) {
+    if ((int)regions[i].copy_count < min_copy ||
+        (max_copy > 0 && (int)regions[i].copy_count > max_copy))
+      continue;
+    const char *label = hub_label[regions[i].family_id]
+                            ? hub_label[regions[i].family_id]
+                            : "unknown";
+    fprintf(fp, "%s\t%zu\t%zu\t%s\t%u\n", regions[i].chrom, regions[i].start,
+            regions[i].end, label, regions[i].copy_count);
+    if (regions[i].family_id != last_fam) {
+      stats.n_families++;
+      last_fam = regions[i].family_id;
+    }
+    stats.n_output++;
+  }
+  fclose(fp);
+  return stats;
+}
+
+static void print_summary(int num_files, size_t num_sketches, size_t n_edges,
+                          size_t reported_edges, size_t n_families,
+                          size_t n_merged, double elapsed,
+                          const char *out_prefix) {
+  fprintf(stderr,
+          "\n=== Reverb Summary ===\n"
+          "Input files        : %d\n"
+          "Total windows      : %zu\n"
+          "Candidate edges    : %zu\n"
+          "Reported SD pairs  : %zu\n"
+          "SD families        : %zu\n"
+          "Merged segments    : %zu\n"
+          "Elapsed time       : %.1fs\n"
+          "Output prefix      : %s\n"
+          "=======================\n",
+          num_files, num_sketches, n_edges, reported_edges, n_families,
+          n_merged, elapsed, out_prefix);
+}
+
+// ==============================================================
+// CMD: DUP
+// ==============================================================
+
 int cmd_dup(int argc, char **argv) {
   SketchBuildParams def = sketch_build_defaults();
   def.scale = 10;
   def.hash_seed = 42;
-  size_t window_size = 10000;
+  size_t window_size = 5000;
   size_t step_size = 0; /* 0 = auto (window/2) */
   size_t min_bases = 1000;
-  double max_dist = 0.05;
+  double max_dist = 0.1;
   int min_copy = 2;
-  int max_copy = 50; /* 0 = unlimited */
+  int max_copy = 50;
   const char *out_prefix = "reverb";
   int n_threads = 8;
 
@@ -690,7 +720,7 @@ int cmd_dup(int argc, char **argv) {
 
   if (step_size == 0)
     step_size = window_size / 2;
-  (void)n_threads; /* reserved for future parallelization */
+  (void)n_threads;
 
   int num_files = argc - opt.ind;
   if (num_files < 1) {
@@ -706,42 +736,47 @@ int cmd_dup(int argc, char **argv) {
   reverb_init(&r, def.kmer_size);
   r.hash_seed = def.hash_seed;
 
+  /* Shared state that needs cleanup */
+  int ret = 0;
   ReverbSketch *sketches = NULL;
   WindowCoord *coords = NULL;
-  size_t num_sketches = 0;
-  size_t cap_sketches = 0;
+  size_t num_sketches = 0, cap_sketches = 0;
+  ReverbDupEdge *edges = NULL;
+  size_t n_edges = 0;
+  ReverbDupRegion *dup_regions = NULL;
+  uint32_t *comp_size = NULL;
+  uint32_t *post_merge_comp_size = NULL;
+  char **hub_label = NULL;
+  UnionFind uf = {0};
 
-  /* Open window BED output */
+  /* Phase 1: Extract sliding window sketches */
   char path_buf[PATH_MAX];
   snprintf(path_buf, sizeof(path_buf), "%s.window.bed", out_prefix);
   FILE *bed_fp = fopen(path_buf, "w");
   if (!bed_fp) {
     fprintf(stderr, "Error: cannot open %s for writing\n", path_buf);
-    return 1;
+    ret = 1;
+    goto cleanup;
   }
 
-  /* Phase 1: Extract sliding window sketches */
   fprintf(stderr, "[reverb] Extracting windows (w=%zu, step=%zu) ...\n",
           window_size, step_size);
-  for (int i = 0; i < num_files; i++) {
+  for (int i = 0; i < num_files; i++)
     dup_stream(in_files[i], &r, &def, window_size, step_size, min_bases,
                &sketches, &coords, &num_sketches, &cap_sketches, bed_fp);
-  }
   fclose(bed_fp);
 
   if (num_sketches == 0) {
     fprintf(stderr, "Error: no valid windows extracted.\n");
-    free(sketches);
-    free(coords);
-    return 1;
+    ret = 1;
+    goto cleanup;
   }
   fprintf(stderr, "[reverb] Total windows: %zu\n", num_sketches);
 
   /* Phase 2: Build inverted hash index and find candidate edges */
   fprintf(stderr, "[reverb] Building hash index and finding candidates ...\n");
-  ReverbDupEdge *edges = NULL;
-  size_t n_edges = build_candidate_edges(sketches, coords, num_sketches,
-                                         max_dist, window_size, &edges);
+  n_edges = build_candidate_edges(sketches, coords, num_sketches, max_dist,
+                                  window_size, &edges);
   fprintf(stderr, "[reverb] Duplicated edges: %zu\n", n_edges);
 
   if (n_edges == 0) {
@@ -751,26 +786,21 @@ int cmd_dup(int argc, char **argv) {
 
   /* Phase 3: Union-Find clustering */
   fprintf(stderr, "[reverb] Clustering SD families ...\n");
-  UnionFind uf;
   uf_init(&uf, num_sketches);
-
-  for (size_t i = 0; i < n_edges; i++) {
+  for (size_t i = 0; i < n_edges; i++)
     uf_union(&uf, edges[i].win_a, edges[i].win_b);
-  }
 
-  /* Count component sizes (pre-merge) */
-  uint32_t *comp_size = calloc(num_sketches, sizeof(uint32_t));
+  comp_size = calloc(num_sketches, sizeof(uint32_t));
   for (size_t i = 0; i < num_sketches; i++)
     comp_size[uf_find(&uf, (uint32_t)i)]++;
 
-  /* Compute per-window degree (connectivity) from edges */
+  /* Find hub window (highest degree) per family */
   uint32_t *win_degree = calloc(num_sketches, sizeof(uint32_t));
   for (size_t i = 0; i < n_edges; i++) {
     win_degree[edges[i].win_a]++;
     win_degree[edges[i].win_b]++;
   }
 
-  /* Find hub window (highest degree) per family */
   uint32_t *hub_window = malloc(num_sketches * sizeof(uint32_t));
   uint32_t *hub_degree = calloc(num_sketches, sizeof(uint32_t));
   for (size_t i = 0; i < num_sketches; i++)
@@ -783,8 +813,8 @@ int cmd_dup(int argc, char **argv) {
     }
   }
 
-  /* Build hub label strings: "chrom@start-end" */
-  char **hub_label = calloc(num_sketches, sizeof(char *));
+  /* Build hub labels: "chrom@start-end" */
+  hub_label = calloc(num_sketches, sizeof(char *));
   for (size_t i = 0; i < num_sketches; i++) {
     uint32_t fam = uf_find(&uf, (uint32_t)i);
     if (fam == i && comp_size[fam] >= 2) {
@@ -799,144 +829,60 @@ int cmd_dup(int argc, char **argv) {
   free(hub_degree);
   free(hub_window);
 
-  /* Collect all windows that belong to families (unfiltered) */
-  size_t n_dup_regions = 0;
-  size_t cap_dup_regions = 256;
-  ReverbDupRegion *dup_regions =
-      malloc(cap_dup_regions * sizeof(ReverbDupRegion));
-
+  /* Collect windows that belong to multi-member families */
+  size_t n_dup_regions = 0, cap_dup_regions = 0;
   for (size_t i = 0; i < num_sketches; i++) {
     uint32_t fam = uf_find(&uf, (uint32_t)i);
     if (comp_size[fam] < 2)
       continue;
-
-    if (n_dup_regions >= cap_dup_regions) {
-      cap_dup_regions *= 2;
-      dup_regions =
-          realloc(dup_regions, cap_dup_regions * sizeof(ReverbDupRegion));
-    }
-    dup_regions[n_dup_regions++] =
-        (ReverbDupRegion){.chrom = coords[i].chrom, /* borrowed pointer */
-                          .start = coords[i].start,
-                          .end = coords[i].end,
-                          .family_id = fam,
-                          .copy_count = comp_size[fam],
-                          .avg_distance = 0.0};
+    DA_PUSH(dup_regions, n_dup_regions, cap_dup_regions,
+            ((ReverbDupRegion){.chrom = coords[i].chrom,
+                               .start = coords[i].start,
+                               .end = coords[i].end,
+                               .family_id = fam,
+                               .copy_count = comp_size[fam],
+                               .avg_distance = 0.0}));
   }
 
   size_t n_merged = merge_dup_regions(dup_regions, n_dup_regions);
 
   /* Recount per-family copy counts after merge */
-  uint32_t *post_merge_comp_size = calloc(num_sketches, sizeof(uint32_t));
-  for (size_t i = 0; i < n_merged; i++) {
-    uint32_t fam = dup_regions[i].family_id;
-    post_merge_comp_size[fam]++;
-  }
-
-  /* Update copy counts in dup_regions */
-  for (size_t i = 0; i < n_merged; i++) {
+  post_merge_comp_size = calloc(num_sketches, sizeof(uint32_t));
+  for (size_t i = 0; i < n_merged; i++)
+    post_merge_comp_size[dup_regions[i].family_id]++;
+  for (size_t i = 0; i < n_merged; i++)
     dup_regions[i].copy_count = post_merge_comp_size[dup_regions[i].family_id];
-  }
 
   /* Phase 4: Write BEDPE output (pairs) */
   snprintf(path_buf, sizeof(path_buf), "%s.dup.bedpe", out_prefix);
-  FILE *bedpe_fp = fopen(path_buf, "w");
-  if (!bedpe_fp) {
-    fprintf(stderr, "Error: cannot open %s\n", path_buf);
-    uf_free(&uf);
-    free(comp_size);
-    free(post_merge_comp_size);
-    free(dup_regions);
-    goto cleanup;
-  }
-
-  fprintf(bedpe_fp, "#chrom1\tstart1\tend1\tchrom2\tstart2\tend2\tfamily\tdista"
-                    "nce\tcopy_count\n");
-  size_t reported_edges = 0;
-  for (size_t i = 0; i < n_edges; i++) {
-    uint32_t a = edges[i].win_a;
-    uint32_t b = edges[i].win_b;
-    uint32_t fam = uf_find(&uf, a);
-    uint32_t cc = post_merge_comp_size[fam];
-    if ((int)cc < min_copy)
-      continue;
-    if (max_copy > 0 && (int)cc > max_copy)
-      continue;
-
-    const char *fam_label = hub_label[fam] ? hub_label[fam] : "unknown";
-    fprintf(bedpe_fp, "%s\t%zu\t%zu\t%s\t%zu\t%zu\t%s\t%.6f\t%u\n",
-            coords[a].chrom, coords[a].start, coords[a].end, coords[b].chrom,
-            coords[b].start, coords[b].end, fam_label, edges[i].distance, cc);
-    reported_edges++;
-  }
-  fclose(bedpe_fp);
+  size_t reported_edges =
+      write_bedpe_output(path_buf, edges, n_edges, coords, &uf,
+                         post_merge_comp_size, hub_label, min_copy, max_copy);
 
   /* Phase 5: Write BED output */
   snprintf(path_buf, sizeof(path_buf), "%s.dup.bed", out_prefix);
-  FILE *dup_bed_fp = fopen(path_buf, "w");
-  if (!dup_bed_fp) {
-    fprintf(stderr, "Error: cannot open %s\n", path_buf);
-    uf_free(&uf);
-    free(comp_size);
-    free(post_merge_comp_size);
-    free(dup_regions);
-    goto cleanup;
-  }
-
-  fprintf(dup_bed_fp, "#chrom\tstart\tend\tfamily\tcopy_count\n");
-  size_t n_families = 0;
-  uint32_t last_fam = UINT32_MAX;
-  size_t n_output = 0;
-  for (size_t i = 0; i < n_merged; i++) {
-    if ((int)dup_regions[i].copy_count < min_copy)
-      continue;
-    if (max_copy > 0 && (int)dup_regions[i].copy_count > max_copy)
-      continue;
-    const char *fam_label = hub_label[dup_regions[i].family_id]
-                                ? hub_label[dup_regions[i].family_id]
-                                : "unknown";
-    fprintf(dup_bed_fp, "%s\t%zu\t%zu\t%s\t%u\n", dup_regions[i].chrom,
-            dup_regions[i].start, dup_regions[i].end, fam_label,
-            dup_regions[i].copy_count);
-    if (dup_regions[i].family_id != last_fam) {
-      n_families++;
-      last_fam = dup_regions[i].family_id;
-    }
-    n_output++;
-  }
-  fclose(dup_bed_fp);
-  n_merged = n_output;
-
-  free(post_merge_comp_size);
+  BedOutputStats bed_stats = write_bed_output(path_buf, dup_regions, n_merged,
+                                              hub_label, min_copy, max_copy);
 
   clock_gettime(CLOCK_MONOTONIC, &t_end);
   double elapsed =
       (t_end.tv_sec - t_start.tv_sec) + (t_end.tv_nsec - t_start.tv_nsec) / 1e9;
 
-  /* Summary */
-  fprintf(stderr,
-          "\n=== Reverb Summary ===\n"
-          "Input files        : %d\n"
-          "Total windows      : %zu\n"
-          "Candidate edges    : %zu\n"
-          "Reported SD pairs  : %zu\n"
-          "SD families        : %zu\n"
-          "Merged segments    : %zu\n"
-          "Elapsed time       : %.1fs\n"
-          "Output prefix      : %s\n"
-          "=======================\n",
-          num_files, num_sketches, n_edges, reported_edges, n_families,
-          n_merged, elapsed, out_prefix);
-
-  free(dup_regions);
-  for (size_t i = 0; i < num_sketches; i++)
-    free(hub_label[i]);
-  free(hub_label);
-  uf_free(&uf);
-  free(comp_size);
+  print_summary(num_files, num_sketches, n_edges, reported_edges,
+                bed_stats.n_families, bed_stats.n_output, elapsed, out_prefix);
 
 cleanup:
   free(edges);
+  free(dup_regions);
+  free(comp_size);
+  free(post_merge_comp_size);
+  if (hub_label) {
+    for (size_t i = 0; i < num_sketches; i++)
+      free(hub_label[i]);
+    free(hub_label);
+  }
+  if (uf.parent)
+    uf_free(&uf);
   for (size_t i = 0; i < num_sketches; i++) {
     reverb_sketch_free(&sketches[i]);
     free(coords[i].chrom);
@@ -944,7 +890,7 @@ cleanup:
   free(sketches);
   free(coords);
 
-  return 0;
+  return ret;
 }
 
 // ==============================================================

@@ -34,11 +34,7 @@ typedef struct {
   size_t shared_hashes;
 } ReverbDistResult;
 
-/* Inverted hash index entry: maps a hash value to its source window */
-typedef struct {
-  uint64_t hash;
-  uint32_t window_id;
-} HashWindowEntry;
+/* (HashWindowEntry is defined internally in reverb.c) */
 
 /* Edge in the duplication graph */
 typedef struct {
