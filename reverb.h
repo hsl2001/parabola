@@ -14,7 +14,6 @@ extern "C" {
 typedef struct {
   uint32_t hash_window;
   __uint128_t remover_mask;
-  __uint128_t layer_mask;
   uint32_t kmer_bits;
   uint32_t rc_shift;
   uint64_t hash_seed;

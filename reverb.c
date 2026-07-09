@@ -14,7 +14,7 @@
 #define DA_PUSH(arr, n, cap, val)                                              \
   do {                                                                         \
     if ((n) >= (cap)) {                                                        \
-      (cap) = (cap) ? (cap) * 2 : 64;                                          \
+      (cap) = (cap) ? (cap) * 2 : 1024;                                        \
       (arr) = realloc((arr), (cap) * sizeof(*(arr)));                          \
     }                                                                          \
     (arr)[(n)++] = (val);                                                      \
@@ -77,13 +77,9 @@ void reverb_init(Reverb *r, size_t hash_window) {
 
   __uint128_t remover_mask =
       (kmer_bits > 3) ? (((__uint128_t)1 << (kmer_bits - 3)) - 1) : 0;
-  __uint128_t layer_mask = 0;
-  for (uint32_t j = 0; j < (uint32_t)k; j++)
-    layer_mask |= (__uint128_t)1 << (3 * j);
 
   r->hash_window = k;
   r->remover_mask = remover_mask;
-  r->layer_mask = layer_mask;
   r->kmer_bits = kmer_bits;
   r->rc_shift = (kmer_bits > 0) ? (128 - kmer_bits) : 128;
 }
@@ -141,35 +137,10 @@ static void pool_finalize(HashPool *pool, uint64_t **out_hashes,
 // SKETCH EXTRACTION
 // ==============================================================
 
-/* Count-Min Sketch filter: returns 1 if hash passes the threshold. */
-static inline int cms_check_and_increment(uint64_t h, int min_count,
-                                          uint8_t *cms_table, size_t cms_mask) {
-  uint64_t k1 = h, k2 = h * MIX_CONST1, k3 = h * MIX_CONST2;
-  size_t h1 = (size_t)((k1 ^ (k1 >> 32)) & cms_mask);
-  size_t h2 = (size_t)((k2 ^ (k2 >> 32)) & cms_mask);
-  size_t h3 = (size_t)((k3 ^ (k3 >> 32)) & cms_mask);
-
-  uint8_t c1 = cms_table[h1], c2 = cms_table[h2], c3 = cms_table[h3];
-  uint8_t min_c = (c1 < c2) ? ((c1 < c3) ? c1 : c3) : ((c2 < c3) ? c2 : c3);
-  uint8_t thr = (uint8_t)(min_count > (int)UINT8_MAX ? UINT8_MAX : min_count);
-
-  if (min_c >= thr)
-    return 0; /* already saturated — skip duplicate insert */
-
-  if (c1 == min_c && c1 < UINT8_MAX)
-    cms_table[h1]++;
-  if (c2 == min_c && c2 < UINT8_MAX)
-    cms_table[h2]++;
-  if (c3 == min_c && c3 < UINT8_MAX)
-    cms_table[h3]++;
-
-  return (uint8_t)(min_c + 1) == thr; /* 1 = just reached threshold */
-}
-
-__attribute__((hot)) static void
-extract_and_insert(const Reverb *r, HashPool *pool, const uint8_t *seq,
-                   size_t len, int min_count, uint8_t *cms_table,
-                   size_t cms_mask) {
+__attribute__((hot)) static void extract_and_insert(const Reverb *r,
+                                                    HashPool *pool,
+                                                    const uint8_t *seq,
+                                                    size_t len) {
   size_t K = r->hash_window;
   __uint128_t fwd = 0;
   size_t valid = 0;
@@ -192,13 +163,8 @@ extract_and_insert(const Reverb *r, HashPool *pool, const uint8_t *seq,
     __uint128_t canon = fwd < rev ? fwd : rev;
     uint64_t h = mix_hash(canon, r->hash_seed);
 
-    if (h >= pool->hash_threshold)
-      continue;
-    if (min_count > 1 && cms_table &&
-        !cms_check_and_increment(h, min_count, cms_table, cms_mask))
-      continue;
-
-    pool_try_insert(pool, h);
+    if (h < pool->hash_threshold)
+      pool_try_insert(pool, h);
   }
 }
 
@@ -286,16 +252,7 @@ void uf_free(UnionFind *uf) {
 // PARAMETERS
 // ==============================================================
 
-typedef struct {
-  uint32_t kmer_size;
-  uint64_t scale;
-  uint64_t hash_seed;
-} SketchBuildParams;
-
-static SketchBuildParams sketch_build_defaults(void) {
-  return (SketchBuildParams){
-      .kmer_size = 21, .scale = 1000, .hash_seed = MIX_CONST1};
-}
+// Params removed, handled directly in cmd_dup
 
 static void print_usage(void) {
   printf("Reverb: Ultra-fast Alignment-free Segmental Duplication Detection\n\n"
@@ -331,9 +288,8 @@ typedef struct {
   uint32_t window_id;
 } HashWindowEntry;
 
-static int dup_stream(const char *filename, const Reverb *r,
-                      SketchBuildParams *params, size_t window_size,
-                      size_t step_size, size_t min_bases,
+static int dup_stream(const char *filename, const Reverb *r, uint64_t scale,
+                      size_t window_size, size_t step_size, size_t min_bases,
                       ReverbSketch **sketches, WindowCoord **coords,
                       size_t *num_sketches, size_t *cap_sketches,
                       FILE *bed_fp) {
@@ -374,7 +330,7 @@ static int dup_stream(const char *filename, const Reverb *r,
                i + window_size);
       sk->name = strdup(namebuf);
       sk->kmer_size = r->hash_window;
-      sk->hash_threshold = UINT64_MAX / params->scale;
+      sk->hash_threshold = UINT64_MAX / scale;
 
       wc->chrom = strdup(ks->name.s);
       wc->start = i;
@@ -386,8 +342,7 @@ static int dup_stream(const char *filename, const Reverb *r,
 
       HashPool pool;
       pool_init(&pool, sk->hash_threshold);
-      extract_and_insert(r, &pool, (const uint8_t *)ks->seq.s + i, window_size,
-                         0, NULL, 0);
+      extract_and_insert(r, &pool, (const uint8_t *)ks->seq.s + i, window_size);
       pool_finalize(&pool, &sk->hashes, &sk->sketch_size);
 
       if (sk->sketch_size > 0) {
@@ -619,7 +574,7 @@ static size_t write_bedpe_output(const char *path, ReverbDupEdge *edges,
     if (a == last_win_a)
       continue;
     last_win_a = a;
-    
+
     uint32_t fam = uf_find(uf, a);
     uint32_t cc = copy_counts[fam];
     if ((int)cc < min_copy || (max_copy > 0 && (int)cc > max_copy))
@@ -695,9 +650,9 @@ static void print_summary(int num_files, size_t num_sketches, size_t n_edges,
 // ==============================================================
 
 int cmd_dup(int argc, char **argv) {
-  SketchBuildParams def = sketch_build_defaults();
-  def.scale = 10;
-  def.hash_seed = 42;
+  uint32_t def_kmer_size = 21;
+  uint64_t def_scale = 10;
+  uint64_t def_hash_seed = 42;
   size_t window_size = 5000;
   size_t step_size = 0; /* 0 = auto (window/2) */
   size_t min_bases = 1000;
@@ -714,11 +669,11 @@ int cmd_dup(int argc, char **argv) {
       print_usage();
       return 0;
     } else if (c == 'k')
-      def.kmer_size = (uint32_t)atoi(opt.arg);
+      def_kmer_size = (uint32_t)atoi(opt.arg);
     else if (c == 's')
-      def.scale = (uint64_t)strtoull(opt.arg, NULL, 10);
+      def_scale = (uint64_t)strtoull(opt.arg, NULL, 10);
     else if (c == 'e')
-      def.hash_seed = strtoull(opt.arg, NULL, 0);
+      def_hash_seed = strtoull(opt.arg, NULL, 0);
     else if (c == 'w')
       window_size = (size_t)strtoull(opt.arg, NULL, 10);
     else if (c == 't')
@@ -754,8 +709,8 @@ int cmd_dup(int argc, char **argv) {
   clock_gettime(CLOCK_MONOTONIC, &t_start);
 
   Reverb r;
-  reverb_init(&r, def.kmer_size);
-  r.hash_seed = def.hash_seed;
+  reverb_init(&r, def_kmer_size);
+  r.hash_seed = def_hash_seed;
 
   /* Shared state that needs cleanup */
   int ret = 0;
@@ -766,7 +721,6 @@ int cmd_dup(int argc, char **argv) {
   size_t n_edges = 0;
   ReverbDupRegion *dup_regions = NULL;
   uint32_t *comp_size = NULL;
-  uint32_t *post_merge_comp_size = NULL;
   char **hub_label = NULL;
   UnionFind uf = {0};
 
@@ -783,7 +737,7 @@ int cmd_dup(int argc, char **argv) {
   fprintf(stderr, "[reverb] Extracting windows (w=%zu, step=%zu) ...\n",
           window_size, step_size);
   for (int i = 0; i < num_files; i++)
-    dup_stream(in_files[i], &r, &def, window_size, step_size, min_bases,
+    dup_stream(in_files[i], &r, def_scale, window_size, step_size, min_bases,
                &sketches, &coords, &num_sketches, &cap_sketches, bed_fp);
   fclose(bed_fp);
 
@@ -867,18 +821,18 @@ int cmd_dup(int argc, char **argv) {
 
   size_t n_merged = merge_dup_regions(dup_regions, n_dup_regions);
 
-  /* Recount per-family copy counts after merge */
-  post_merge_comp_size = calloc(num_sketches, sizeof(uint32_t));
+  /* Recount per-family copy counts after merge, reusing comp_size */
+  memset(comp_size, 0, num_sketches * sizeof(uint32_t));
   for (size_t i = 0; i < n_merged; i++)
-    post_merge_comp_size[dup_regions[i].family_id]++;
+    comp_size[dup_regions[i].family_id]++;
   for (size_t i = 0; i < n_merged; i++)
-    dup_regions[i].copy_count = post_merge_comp_size[dup_regions[i].family_id];
+    dup_regions[i].copy_count = comp_size[dup_regions[i].family_id];
 
   /* Phase 4: Write BEDPE output (pairs) */
   snprintf(path_buf, sizeof(path_buf), "%s.dup.bedpe", out_prefix);
   size_t reported_edges =
-      write_bedpe_output(path_buf, edges, n_edges, coords, &uf,
-                         post_merge_comp_size, hub_label, min_copy, max_copy);
+      write_bedpe_output(path_buf, edges, n_edges, coords, &uf, comp_size,
+                         hub_label, min_copy, max_copy);
 
   /* Phase 5: Write BED output */
   snprintf(path_buf, sizeof(path_buf), "%s.dup.bed", out_prefix);
@@ -896,7 +850,6 @@ cleanup:
   free(edges);
   free(dup_regions);
   free(comp_size);
-  free(post_merge_comp_size);
   if (hub_label) {
     for (size_t i = 0; i < num_sketches; i++)
       free(hub_label[i]);
