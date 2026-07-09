@@ -584,6 +584,18 @@ static size_t merge_dup_regions(ReverbDupRegion *regions, size_t n) {
 // DUP: OUTPUT HELPERS
 // ==============================================================
 
+static int cmp_edge_for_bedpe(const void *p1, const void *p2) {
+  const ReverbDupEdge *e1 = (const ReverbDupEdge *)p1;
+  const ReverbDupEdge *e2 = (const ReverbDupEdge *)p2;
+  if (e1->win_a != e2->win_a)
+    return (e1->win_a < e2->win_a) ? -1 : 1;
+  if (e1->distance < e2->distance)
+    return -1;
+  if (e1->distance > e2->distance)
+    return 1;
+  return 0;
+}
+
 static size_t write_bedpe_output(const char *path, ReverbDupEdge *edges,
                                  size_t n_edges, WindowCoord *coords,
                                  UnionFind *uf, uint32_t *copy_counts,
@@ -594,11 +606,20 @@ static size_t write_bedpe_output(const char *path, ReverbDupEdge *edges,
     return 0;
   }
 
+  if (n_edges > 0) {
+    qsort(edges, n_edges, sizeof(ReverbDupEdge), cmp_edge_for_bedpe);
+  }
+
   fprintf(fp, "#chrom1\tstart1\tend1\tchrom2\tstart2\tend2\tfamily\t"
               "distance\tcopy_count\n");
   size_t reported = 0;
+  uint32_t last_win_a = (uint32_t)-1;
   for (size_t i = 0; i < n_edges; i++) {
     uint32_t a = edges[i].win_a, b = edges[i].win_b;
+    if (a == last_win_a)
+      continue;
+    last_win_a = a;
+    
     uint32_t fam = uf_find(uf, a);
     uint32_t cc = copy_counts[fam];
     if ((int)cc < min_copy || (max_copy > 0 && (int)cc > max_copy))
