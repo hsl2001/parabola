@@ -7,7 +7,7 @@
 #include "klib/kseq.h"
 #include "reverb.h"
 
-void kt_for(int n_threads, void (*func)(void*,long,int), void *data, long n);
+void kt_for(int n_threads, void (*func)(void *, long, int), void *data, long n);
 
 #define MIX_CONST1 0xff51afd7ed558ccdULL
 #define MIX_CONST2 0xc4ceb9fe1a85ec53ULL
@@ -321,33 +321,36 @@ typedef struct {
 static void edge_worker(void *data, long i, int tid) {
   EdgeWorkerData *w = (EdgeWorkerData *)data;
   uint32_t a = (uint32_t)i;
-  
+
   uint16_t *counts = calloc(w->n_windows, sizeof(uint16_t));
   uint32_t *touched = malloc(w->n_windows * sizeof(uint32_t));
   size_t n_touched = 0;
 
   for (size_t k = 0; k < w->sketches[a].sketch_size; k++) {
     uint64_t hash = w->sketches[a].hashes[k];
-    
+
     // Binary search in entries
     size_t left = 0, right = w->total_entries;
     while (left < right) {
       size_t mid = left + (right - left) / 2;
-      if (w->entries[mid].hash < hash) left = mid + 1;
-      else right = mid;
+      if (w->entries[mid].hash < hash)
+        left = mid + 1;
+      else
+        right = mid;
     }
-    
+
     if (left < w->total_entries && w->entries[left].hash == hash) {
       size_t run_end = left + 1;
       while (run_end < w->total_entries && w->entries[run_end].hash == hash)
         run_end++;
       size_t run_len = run_end - left;
-      
+
       if (run_len >= 2 && run_len <= 100) {
         for (size_t idx = left; idx < run_end; idx++) {
           uint32_t b = w->entries[idx].window_id;
           if (b > a) {
-            if (counts[b] == 0) touched[n_touched++] = b;
+            if (counts[b] == 0)
+              touched[n_touched++] = b;
             counts[b]++;
           }
         }
@@ -420,13 +423,15 @@ static size_t build_candidate_edges(ReverbSketch *sketches, WindowCoord *coords,
   free(entries);
 
   size_t n_edges = 0;
-  for (int t = 0; t < n_threads; t++) n_edges += w.t_n_edges[t];
+  for (int t = 0; t < n_threads; t++)
+    n_edges += w.t_n_edges[t];
 
   ReverbDupEdge *edges = malloc(n_edges * sizeof(ReverbDupEdge));
   size_t offset = 0;
   for (int t = 0; t < n_threads; t++) {
     if (w.t_n_edges[t] > 0) {
-      memcpy(edges + offset, w.t_edges[t], w.t_n_edges[t] * sizeof(ReverbDupEdge));
+      memcpy(edges + offset, w.t_edges[t],
+             w.t_n_edges[t] * sizeof(ReverbDupEdge));
       offset += w.t_n_edges[t];
       free(w.t_edges[t]);
     }
@@ -753,7 +758,8 @@ static void do_subclustering(ReverbDupRegion *regions, size_t n_merged,
     for (size_t k = 0; k < w.t_n_pairs[t]; k++) {
       uf_union(&sub_uf, w.t_pairs[t][k].i, w.t_pairs[t][k].j);
     }
-    if (w.t_pairs[t]) free(w.t_pairs[t]);
+    if (w.t_pairs[t])
+      free(w.t_pairs[t]);
   }
   free(w.t_pairs);
   free(w.t_n_pairs);
@@ -1311,8 +1317,8 @@ int cmd_pangenome(int argc, char **argv, const char *pangenome_dir,
   }
   fclose(bed_fp);
 
-  size_t n_edges = build_candidate_edges(sketches, coords, num_sketches,
-                                         max_dist, window_size, n_threads, &edges);
+  size_t n_edges = build_candidate_edges(
+      sketches, coords, num_sketches, max_dist, window_size, n_threads, &edges);
 
   uint32_t *genome_id = calloc(num_sketches, sizeof(uint32_t));
   for (size_t i = 0; i < num_sketches; i++) {
