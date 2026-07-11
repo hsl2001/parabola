@@ -20,10 +20,7 @@ typedef struct {
 } Reverb;
 
 typedef struct {
-  char *name;
-  uint32_t kmer_size;
   size_t sketch_size;
-  uint64_t hash_threshold;
   uint64_t *hashes;
 } ReverbSketch;
 
@@ -37,15 +34,14 @@ typedef struct {
 
 /* Edge in the duplication graph */
 typedef struct {
-  uint32_t win_a;
-  uint32_t win_b;
+  uint64_t win_a;
+  uint64_t win_b;
   double distance;
 } ReverbDupEdge;
 
-/* Union-Find for SD family clustering */
 typedef struct {
-  uint32_t *parent;
-  uint32_t *rank;
+  uint64_t *parent;
+  uint64_t *rank;
   size_t n;
 } UnionFind;
 
@@ -64,12 +60,12 @@ typedef struct {
 void reverb_init(Reverb *r, size_t hash_window);
 void reverb_sketch_free(ReverbSketch *sk);
 ReverbDistResult reverb_dist(const ReverbSketch *ref,
-                             const ReverbSketch *query);
+                             const ReverbSketch *query, uint32_t kmer_size);
 
 /* Union-Find operations */
 void uf_init(UnionFind *uf, size_t n);
-uint32_t uf_find(UnionFind *uf, uint32_t x);
-void uf_union(UnionFind *uf, uint32_t a, uint32_t b);
+uint64_t uf_find(UnionFind *uf, uint64_t x);
+void uf_union(UnionFind *uf, uint64_t a, uint64_t b);
 void uf_free(UnionFind *uf);
 
 #ifdef __cplusplus

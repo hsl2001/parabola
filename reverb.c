@@ -180,7 +180,6 @@ __attribute__((hot)) static void extract_and_insert(const Reverb *r,
 
 void reverb_sketch_free(ReverbSketch *sk) {
   if (sk) {
-    free(sk->name);
     free(sk->hashes);
   }
 }
@@ -189,11 +188,9 @@ void reverb_sketch_free(ReverbSketch *sk) {
 // DISTANCE CALCULATION
 // ==============================================================
 
-ReverbDistResult reverb_dist(const ReverbSketch *ref,
-                             const ReverbSketch *query) {
+ReverbDistResult reverb_dist(const ReverbSketch *ref, const ReverbSketch *query,
+                             uint32_t kmer_size) {
   ReverbDistResult res = {0.0, 1.0, 0};
-  if (ref->kmer_size == 0 || query->kmer_size != ref->kmer_size)
-    return res;
 
   size_t shared = 0, i = 0, j = 0;
   while (i < ref->sketch_size && j < query->sketch_size) {
@@ -212,7 +209,7 @@ ReverbDistResult reverb_dist(const ReverbSketch *ref,
   if (ref->sketch_size > 0 && query->sketch_size > 0) {
     res.containment =
         0.5 * shared * (1.0 / ref->sketch_size + 1.0 / query->sketch_size);
-    res.distance = 1.0 - pow(res.containment, 1.0 / (double)ref->kmer_size);
+    res.distance = 1.0 - pow(res.containment, 1.0 / (double)kmer_size);
   }
   return res;
 }
@@ -223,13 +220,13 @@ ReverbDistResult reverb_dist(const ReverbSketch *ref,
 
 void uf_init(UnionFind *uf, size_t n) {
   uf->n = n;
-  uf->parent = (uint32_t *)malloc(n * sizeof(uint32_t));
-  uf->rank = (uint32_t *)calloc(n, sizeof(uint32_t));
+  uf->parent = (uint64_t *)malloc(n * sizeof(uint64_t));
+  uf->rank = (uint64_t *)calloc(n, sizeof(uint64_t));
   for (size_t i = 0; i < n; i++)
-    uf->parent[i] = (uint32_t)i;
+    uf->parent[i] = (uint64_t)i;
 }
 
-uint32_t uf_find(UnionFind *uf, uint32_t x) {
+uint64_t uf_find(UnionFind *uf, uint64_t x) {
   while (uf->parent[x] != x) {
     uf->parent[x] = uf->parent[uf->parent[x]]; /* path splitting */
     x = uf->parent[x];
@@ -237,13 +234,13 @@ uint32_t uf_find(UnionFind *uf, uint32_t x) {
   return x;
 }
 
-void uf_union(UnionFind *uf, uint32_t a, uint32_t b) {
+void uf_union(UnionFind *uf, uint64_t a, uint64_t b) {
   a = uf_find(uf, a);
   b = uf_find(uf, b);
   if (a == b)
     return;
   if (uf->rank[a] < uf->rank[b])
-    SWAP(uint32_t, a, b);
+    SWAP(uint64_t, a, b);
   uf->parent[b] = a;
   if (uf->rank[a] == uf->rank[b])
     uf->rank[a]++;
@@ -283,7 +280,7 @@ static void print_usage(void) {
 // ==============================================================
 
 typedef struct {
-  char *chrom;
+  uint32_t seq_id;
   size_t start;
   size_t end;
 } WindowCoord;
@@ -291,7 +288,7 @@ typedef struct {
 /* Inverted hash index entry: maps a hash value to its source window */
 typedef struct {
   uint64_t hash;
-  uint32_t window_id;
+  uint64_t window_id;
 } HashWindowEntry;
 
 // ==============================================================
@@ -313,6 +310,7 @@ typedef struct {
   size_t n_windows;
   double max_dist;
   size_t window_size;
+  uint32_t kmer_size;
   ReverbDupEdge **t_edges;
   size_t *t_n_edges;
   size_t *t_cap_edges;
@@ -320,10 +318,10 @@ typedef struct {
 
 static void edge_worker(void *data, long i, int tid) {
   EdgeWorkerData *w = (EdgeWorkerData *)data;
-  uint32_t a = (uint32_t)i;
+  uint64_t a = (uint64_t)i;
 
   uint16_t *counts = calloc(w->n_windows, sizeof(uint16_t));
-  uint32_t *touched = malloc(w->n_windows * sizeof(uint32_t));
+  uint64_t *touched = malloc(w->n_windows * sizeof(uint64_t));
   size_t n_touched = 0;
 
   for (size_t k = 0; k < w->sketches[a].sketch_size; k++) {
@@ -347,7 +345,7 @@ static void edge_worker(void *data, long i, int tid) {
 
       if (run_len >= 2 && run_len <= 100) {
         for (size_t idx = left; idx < run_end; idx++) {
-          uint32_t b = w->entries[idx].window_id;
+          uint64_t b = w->entries[idx].window_id;
           if (b > a) {
             if (counts[b] == 0)
               touched[n_touched++] = b;
@@ -359,11 +357,12 @@ static void edge_worker(void *data, long i, int tid) {
   }
 
   for (size_t t = 0; t < n_touched; t++) {
-    uint32_t b = touched[t];
+    uint64_t b = touched[t];
     if (counts[b] >= 2) {
-      if (strcmp(w->coords[a].chrom, w->coords[b].chrom) != 0 ||
+      if (w->coords[a].seq_id != w->coords[b].seq_id ||
           ABS_DIFF(w->coords[a].start, w->coords[b].start) >= w->window_size) {
-        ReverbDistResult d = reverb_dist(&w->sketches[a], &w->sketches[b]);
+        ReverbDistResult d =
+            reverb_dist(&w->sketches[a], &w->sketches[b], w->kmer_size);
         if (d.distance < w->max_dist) {
           DA_PUSH(w->t_edges[tid], w->t_n_edges[tid], w->t_cap_edges[tid],
                   ((ReverbDupEdge){a, b, d.distance}));
@@ -383,6 +382,7 @@ static void edge_worker(void *data, long i, int tid) {
 static size_t build_candidate_edges(ReverbSketch *sketches, WindowCoord *coords,
                                     size_t n_windows, double max_dist,
                                     size_t window_size, int n_threads,
+                                    uint32_t kmer_size,
                                     ReverbDupEdge **out_edges) {
   /* 1. Flatten all (hash, window_id) entries */
   size_t total_entries = 0;
@@ -399,7 +399,7 @@ static size_t build_candidate_edges(ReverbSketch *sketches, WindowCoord *coords,
   for (size_t i = 0; i < n_windows; i++) {
     for (size_t j = 0; j < sketches[i].sketch_size; j++) {
       entries[idx++] = (HashWindowEntry){.hash = sketches[i].hashes[j],
-                                         .window_id = (uint32_t)i};
+                                         .window_id = (uint64_t)i};
     }
   }
 
@@ -415,6 +415,7 @@ static size_t build_candidate_edges(ReverbSketch *sketches, WindowCoord *coords,
   w.n_windows = n_windows;
   w.max_dist = max_dist;
   w.window_size = window_size;
+  w.kmer_size = kmer_size;
   w.t_edges = calloc(n_threads, sizeof(ReverbDupEdge *));
   w.t_n_edges = calloc(n_threads, sizeof(size_t));
   w.t_cap_edges = calloc(n_threads, sizeof(size_t));
@@ -617,31 +618,21 @@ static int dup_stream_pangenome(const char *filename, const char *bname,
       WindowCoord *wc = &(*coords)[*num_sketches];
       memset(sk, 0, sizeof(ReverbSketch));
 
-      size_t name_len = strlen(chr_name) + 64;
-      char *namebuf = malloc(name_len);
-      snprintf(namebuf, name_len, "%s_%zu_%zu", chr_name, i, i + window_size);
-      sk->name = namebuf;
-      sk->kmer_size = r->hash_window;
-      sk->hash_threshold = UINT64_MAX / scale;
-
-      wc->chrom = strdup(chr_name);
+      wc->seq_id = (uint32_t)(*num_seqs - 1);
       wc->start = i;
       wc->end = i + window_size;
 
       if (bed_fp)
-        fprintf(bed_fp, "%s\t%zu\t%zu\t%s\n", chr_name, i, i + window_size,
-                sk->name);
+        fprintf(bed_fp, "%s\t%zu\t%zu\t%s_%zu_%zu\n", chr_name, i,
+                i + window_size, chr_name, i, i + window_size);
 
       HashPool pool;
-      pool_init(&pool, sk->hash_threshold);
+      pool_init(&pool, UINT64_MAX / scale);
       extract_and_insert(r, &pool, (const uint8_t *)ks->seq.s + i, window_size);
       pool_finalize(&pool, &sk->hashes, &sk->sketch_size);
 
       if (sk->sketch_size > 0) {
         (*num_sketches)++;
-      } else {
-        free(sk->name);
-        free(wc->chrom);
       }
     }
   }
@@ -688,12 +679,10 @@ static void do_pass2(char **files, int num_files, const Reverb *r,
           if (right_len > 0)
             memcpy(flank_seq + left_len, ks->seq.s + end, right_len);
 
-          regions[i].flank_sketch.kmer_size = r->hash_window;
-          regions[i].flank_sketch.hash_threshold = UINT64_MAX / scale;
-          regions[i].flank_sketch.name = strdup(chr_name); // placeholder
+          // flank_sketch fields removed for memory optimization
 
           HashPool pool;
-          pool_init(&pool, regions[i].flank_sketch.hash_threshold);
+          pool_init(&pool, UINT64_MAX / scale);
           extract_and_insert(r, &pool, flank_seq, left_len + right_len);
           pool_finalize(&pool, &regions[i].flank_sketch.hashes,
                         &regions[i].flank_sketch.sketch_size);
@@ -718,6 +707,7 @@ typedef struct {
   SubclusterPair **t_pairs;
   size_t *t_n_pairs;
   size_t *t_cap_pairs;
+  uint32_t kmer_size;
 } SubclusterData;
 
 static void subcluster_worker(void *data, long i, int tid) {
@@ -730,8 +720,8 @@ static void subcluster_worker(void *data, long i, int tid) {
     if (w->regions[j].flank_sketch.sketch_size == 0)
       continue;
 
-    ReverbDistResult d =
-        reverb_dist(&w->regions[i].flank_sketch, &w->regions[j].flank_sketch);
+    ReverbDistResult d = reverb_dist(&w->regions[i].flank_sketch,
+                                     &w->regions[j].flank_sketch, w->kmer_size);
     if (d.distance < w->max_dist) {
       DA_PUSH(w->t_pairs[tid], w->t_n_pairs[tid], w->t_cap_pairs[tid],
               ((SubclusterPair){(uint32_t)i, (uint32_t)j}));
@@ -740,7 +730,8 @@ static void subcluster_worker(void *data, long i, int tid) {
 }
 
 static void do_subclustering(ReverbDupRegion *regions, size_t n_merged,
-                             double max_dist, int n_threads) {
+                             double max_dist, int n_threads,
+                             uint32_t kmer_size) {
   UnionFind sub_uf;
   uf_init(&sub_uf, n_merged);
 
@@ -748,6 +739,7 @@ static void do_subclustering(ReverbDupRegion *regions, size_t n_merged,
   w.regions = regions;
   w.max_dist = max_dist;
   w.n_merged = n_merged;
+  w.kmer_size = kmer_size;
   w.t_pairs = calloc(n_threads, sizeof(SubclusterPair *));
   w.t_n_pairs = calloc(n_threads, sizeof(size_t));
   w.t_cap_pairs = calloc(n_threads, sizeof(size_t));
@@ -1170,7 +1162,8 @@ static TE *load_tes(const char *gff_file, size_t *num_tes) {
       TE te;
       memset(&te, 0, sizeof(TE));
       size_t chrom_len = strlen(parts[0]);
-      if (chrom_len >= sizeof(te.chrom)) chrom_len = sizeof(te.chrom) - 1;
+      if (chrom_len >= sizeof(te.chrom))
+        chrom_len = sizeof(te.chrom) - 1;
       memcpy(te.chrom, parts[0], chrom_len);
       te.chrom[chrom_len] = '\0';
       te.start = strtoull(parts[3], NULL, 10);
@@ -1320,17 +1313,16 @@ int cmd_pangenome(int argc, char **argv, const char *pangenome_dir,
   }
   fclose(bed_fp);
 
-  size_t n_edges = build_candidate_edges(
-      sketches, coords, num_sketches, max_dist, window_size, n_threads, &edges);
+  size_t n_edges =
+      build_candidate_edges(sketches, coords, num_sketches, max_dist,
+                            window_size, n_threads, r->hash_window, &edges);
 
   uint32_t *genome_id = calloc(num_sketches, sizeof(uint32_t));
   for (size_t i = 0; i < num_sketches; i++) {
     for (int f = 0; f < num_files; f++) {
       char bname[256];
       get_basename(files[f], bname, sizeof(bname));
-      int blen = strlen(bname);
-      if (strncmp(coords[i].chrom, bname, blen) == 0 &&
-          coords[i].chrom[blen] == '-') {
+      if (strcmp(seq_lens[coords[i].seq_id].genome, bname) == 0) {
         genome_id[i] = f;
         break;
       }
@@ -1349,12 +1341,12 @@ int cmd_pangenome(int argc, char **argv, const char *pangenome_dir,
 
   uint32_t *comp_size_intra = calloc(num_sketches, sizeof(uint32_t));
   for (size_t i = 0; i < num_sketches; i++) {
-    comp_size_intra[uf_find(&uf_intra, (uint32_t)i)]++;
+    comp_size_intra[uf_find(&uf_intra, (uint64_t)i)]++;
   }
 
   uint8_t *is_sd = calloc(num_sketches, sizeof(uint8_t));
   for (size_t i = 0; i < num_sketches; i++) {
-    uint32_t fam = uf_find(&uf_intra, (uint32_t)i);
+    uint64_t fam = uf_find(&uf_intra, (uint64_t)i);
     if (comp_size_intra[fam] >= (uint32_t)min_copy &&
         (max_copy <= 0 || comp_size_intra[fam] <= (uint32_t)max_copy)) {
       is_sd[i] = 1;
@@ -1367,8 +1359,8 @@ int cmd_pangenome(int argc, char **argv, const char *pangenome_dir,
   UnionFind uf;
   uf_init(&uf, num_sketches);
   for (size_t i = 0; i < n_edges; i++) {
-    uint32_t a = edges[i].win_a;
-    uint32_t b = edges[i].win_b;
+    uint64_t a = edges[i].win_a;
+    uint64_t b = edges[i].win_b;
     if (genome_id[a] == genome_id[b]) {
       uf_union(&uf, a, b);
     } else if (is_sd[a] || is_sd[b]) {
@@ -1379,22 +1371,24 @@ int cmd_pangenome(int argc, char **argv, const char *pangenome_dir,
   uint8_t *final_is_sd = calloc(num_sketches, sizeof(uint8_t));
   for (size_t i = 0; i < num_sketches; i++) {
     if (is_sd[i])
-      final_is_sd[uf_find(&uf, (uint32_t)i)] = 1;
+      final_is_sd[uf_find(&uf, (uint64_t)i)] = 1;
   }
   free(is_sd);
 
   uint32_t *comp_size = calloc(num_sketches, sizeof(uint32_t));
   for (size_t i = 0; i < num_sketches; i++)
-    comp_size[uf_find(&uf, (uint32_t)i)]++;
+    comp_size[uf_find(&uf, (uint64_t)i)]++;
 
   char **hub_label = calloc(num_sketches, sizeof(char *));
   for (size_t i = 0; i < num_sketches; i++) {
     if (genome_id[i] == 0) {
-      uint32_t fam = uf_find(&uf, (uint32_t)i);
+      uint64_t fam = uf_find(&uf, (uint64_t)i);
       if (!hub_label[fam]) {
         char buf[512];
-        snprintf(buf, sizeof(buf), "%s@%zu-%zu", coords[i].chrom,
-                 coords[i].start, coords[i].end);
+        snprintf(buf, sizeof(buf), "%s-%s@%zu-%zu",
+                 seq_lens[coords[i].seq_id].genome,
+                 seq_lens[coords[i].seq_id].seq, coords[i].start,
+                 coords[i].end);
         hub_label[fam] = strdup(buf);
       }
     }
@@ -1404,14 +1398,18 @@ int cmd_pangenome(int argc, char **argv, const char *pangenome_dir,
   size_t n_dup_regions = 0, cap_dup_regions = 0;
   ReverbDupRegion *dup_regions = NULL;
   for (size_t i = 0; i < num_sketches; i++) {
-    uint32_t fam = uf_find(&uf, (uint32_t)i);
+    uint64_t fam = uf_find(&uf, (uint64_t)i);
     if (!final_is_sd[fam])
       continue;
 
     const char *label = hub_label[fam] ? hub_label[fam] : "unknown";
 
+    char chrom_name[512];
+    snprintf(chrom_name, sizeof(chrom_name), "%s-%s",
+             seq_lens[coords[i].seq_id].genome, seq_lens[coords[i].seq_id].seq);
+
     DA_PUSH(dup_regions, n_dup_regions, cap_dup_regions,
-            ((ReverbDupRegion){.chrom = coords[i].chrom,
+            ((ReverbDupRegion){.chrom = strdup(chrom_name),
                                .start = coords[i].start,
                                .end = coords[i].end,
                                .cluster_id = strdup(label),
@@ -1431,14 +1429,21 @@ int cmd_pangenome(int argc, char **argv, const char *pangenome_dir,
       out_bedpe,
       "#chrom1\tstart1\tend1\tchrom2\tstart2\tend2\tcluster_id\tdistance\n");
   for (size_t i = 0; i < n_edges; i++) {
-    uint32_t a = edges[i].win_a;
-    uint32_t b = edges[i].win_b;
-    uint32_t fam = uf_find(&uf, a);
+    uint64_t a = edges[i].win_a;
+    uint64_t b = edges[i].win_b;
+    uint64_t fam = uf_find(&uf, a);
     if (!hub_label[fam])
       continue;
-    fprintf(out_bedpe, "%s\t%zu\t%zu\t%s\t%zu\t%zu\t%s\t%.6f\n",
-            coords[a].chrom, coords[a].start, coords[a].end, coords[b].chrom,
-            coords[b].start, coords[b].end, hub_label[fam], edges[i].distance);
+
+    char chrom_a[512], chrom_b[512];
+    snprintf(chrom_a, sizeof(chrom_a), "%s-%s",
+             seq_lens[coords[a].seq_id].genome, seq_lens[coords[a].seq_id].seq);
+    snprintf(chrom_b, sizeof(chrom_b), "%s-%s",
+             seq_lens[coords[b].seq_id].genome, seq_lens[coords[b].seq_id].seq);
+
+    fprintf(out_bedpe, "%s\t%zu\t%zu\t%s\t%zu\t%zu\t%s\t%.6f\n", chrom_a,
+            coords[a].start, coords[a].end, chrom_b, coords[b].start,
+            coords[b].end, hub_label[fam], edges[i].distance);
   }
   fclose(out_bedpe);
 
@@ -1467,7 +1472,7 @@ int cmd_pangenome(int argc, char **argv, const char *pangenome_dir,
            flank_size == 0 ? window_size : flank_size);
 
   fprintf(stderr, "[reverb] Pass 2: Sub-clustering flanking sequences...\n");
-  do_subclustering(dup_regions, n_merged, max_dist, n_threads);
+  do_subclustering(dup_regions, n_merged, max_dist, n_threads, r->hash_window);
 
   // Output dup.bed
   snprintf(path_buf, sizeof(path_buf), "%s.dup.bed", out_prefix);
