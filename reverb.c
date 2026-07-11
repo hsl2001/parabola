@@ -7,6 +7,8 @@
 #include "klib/kseq.h"
 #include "reverb.h"
 
+void kt_for(int n_threads, void (*func)(void*,long,int), void *data, long n);
+
 #define MIX_CONST1 0xff51afd7ed558ccdULL
 #define MIX_CONST2 0xc4ceb9fe1a85ec53ULL
 
@@ -304,16 +306,72 @@ static int cmp_hash_window_entry(const void *a, const void *b) {
 }
 
 typedef struct {
-  uint32_t win_a;
-  uint32_t win_b;
-  uint32_t shared_count;
-} CandidatePair;
+  ReverbSketch *sketches;
+  WindowCoord *coords;
+  HashWindowEntry *entries;
+  size_t total_entries;
+  size_t n_windows;
+  double max_dist;
+  size_t window_size;
+  ReverbDupEdge **t_edges;
+  size_t *t_n_edges;
+  size_t *t_cap_edges;
+} EdgeWorkerData;
 
-static int cmp_candidate_pair(const void *a, const void *b) {
-  const CandidatePair *pa = (const CandidatePair *)a,
-                      *pb = (const CandidatePair *)b;
-  return pa->win_a != pb->win_a ? CMP(pa->win_a, pb->win_a)
-                                : CMP(pa->win_b, pb->win_b);
+static void edge_worker(void *data, long i, int tid) {
+  EdgeWorkerData *w = (EdgeWorkerData *)data;
+  uint32_t a = (uint32_t)i;
+  
+  uint16_t *counts = calloc(w->n_windows, sizeof(uint16_t));
+  uint32_t *touched = malloc(w->n_windows * sizeof(uint32_t));
+  size_t n_touched = 0;
+
+  for (size_t k = 0; k < w->sketches[a].sketch_size; k++) {
+    uint64_t hash = w->sketches[a].hashes[k];
+    
+    // Binary search in entries
+    size_t left = 0, right = w->total_entries;
+    while (left < right) {
+      size_t mid = left + (right - left) / 2;
+      if (w->entries[mid].hash < hash) left = mid + 1;
+      else right = mid;
+    }
+    
+    if (left < w->total_entries && w->entries[left].hash == hash) {
+      size_t run_end = left + 1;
+      while (run_end < w->total_entries && w->entries[run_end].hash == hash)
+        run_end++;
+      size_t run_len = run_end - left;
+      
+      if (run_len >= 2 && run_len <= 100) {
+        for (size_t idx = left; idx < run_end; idx++) {
+          uint32_t b = w->entries[idx].window_id;
+          if (b > a) {
+            if (counts[b] == 0) touched[n_touched++] = b;
+            counts[b]++;
+          }
+        }
+      }
+    }
+  }
+
+  for (size_t t = 0; t < n_touched; t++) {
+    uint32_t b = touched[t];
+    if (counts[b] >= 2) {
+      if (strcmp(w->coords[a].chrom, w->coords[b].chrom) != 0 ||
+          ABS_DIFF(w->coords[a].start, w->coords[b].start) >= w->window_size) {
+        ReverbDistResult d = reverb_dist(&w->sketches[a], &w->sketches[b]);
+        if (d.distance < w->max_dist) {
+          DA_PUSH(w->t_edges[tid], w->t_n_edges[tid], w->t_cap_edges[tid],
+                  ((ReverbDupEdge){a, b, d.distance}));
+        }
+      }
+    }
+    counts[b] = 0;
+  }
+
+  free(counts);
+  free(touched);
 }
 
 /* Build inverted hash index and find candidate pairs.
@@ -321,7 +379,7 @@ static int cmp_candidate_pair(const void *a, const void *b) {
  * on the same chromosome. */
 static size_t build_candidate_edges(ReverbSketch *sketches, WindowCoord *coords,
                                     size_t n_windows, double max_dist,
-                                    size_t window_size,
+                                    size_t window_size, int n_threads,
                                     ReverbDupEdge **out_edges) {
   /* 1. Flatten all (hash, window_id) entries */
   size_t total_entries = 0;
@@ -345,76 +403,43 @@ static size_t build_candidate_edges(ReverbSketch *sketches, WindowCoord *coords,
   /* 2. Sort by hash value */
   qsort(entries, total_entries, sizeof(HashWindowEntry), cmp_hash_window_entry);
 
-  /* 3. For each group sharing the same hash, emit (win_a, win_b) pairs */
-  size_t n_candidates = 0, cap_candidates = 0;
-  CandidatePair *candidates = NULL;
+  /* 3. Parallel distance computation using query-driven search */
+  EdgeWorkerData w;
+  w.sketches = sketches;
+  w.coords = coords;
+  w.entries = entries;
+  w.total_entries = total_entries;
+  w.n_windows = n_windows;
+  w.max_dist = max_dist;
+  w.window_size = window_size;
+  w.t_edges = calloc(n_threads, sizeof(ReverbDupEdge *));
+  w.t_n_edges = calloc(n_threads, sizeof(size_t));
+  w.t_cap_edges = calloc(n_threads, sizeof(size_t));
 
-  size_t run_start = 0;
-  while (run_start < total_entries) {
-    size_t run_end = run_start + 1;
-    while (run_end < total_entries &&
-           entries[run_end].hash == entries[run_start].hash)
-      run_end++;
-
-    size_t run_len = run_end - run_start;
-    if (run_len >= 2 && run_len <= 100) {
-      for (size_t i = run_start; i < run_end; i++) {
-        for (size_t j = i + 1; j < run_end; j++) {
-          uint32_t a = entries[i].window_id;
-          uint32_t b = entries[j].window_id;
-          if (a == b)
-            continue;
-          if (a > b)
-            SWAP(uint32_t, a, b);
-          DA_PUSH(candidates, n_candidates, cap_candidates,
-                  ((CandidatePair){a, b, 1}));
-        }
-      }
-    }
-    run_start = run_end;
-  }
+  kt_for(n_threads, edge_worker, &w, n_windows);
   free(entries);
 
-  if (n_candidates == 0) {
-    *out_edges = NULL;
-    return 0;
-  }
+  size_t n_edges = 0;
+  for (int t = 0; t < n_threads; t++) n_edges += w.t_n_edges[t];
 
-  /* 4. Sort and merge duplicates to get shared_count */
-  qsort(candidates, n_candidates, sizeof(CandidatePair), cmp_candidate_pair);
-
-  size_t n_unique = 0;
-  for (size_t i = 0; i < n_candidates; i++) {
-    if (n_unique > 0 && candidates[n_unique - 1].win_a == candidates[i].win_a &&
-        candidates[n_unique - 1].win_b == candidates[i].win_b) {
-      candidates[n_unique - 1].shared_count++;
-    } else {
-      candidates[n_unique++] = candidates[i];
+  ReverbDupEdge *edges = malloc(n_edges * sizeof(ReverbDupEdge));
+  size_t offset = 0;
+  for (int t = 0; t < n_threads; t++) {
+    if (w.t_n_edges[t] > 0) {
+      memcpy(edges + offset, w.t_edges[t], w.t_n_edges[t] * sizeof(ReverbDupEdge));
+      offset += w.t_n_edges[t];
+      free(w.t_edges[t]);
     }
   }
+  free(w.t_edges);
+  free(w.t_n_edges);
+  free(w.t_cap_edges);
 
-  /* 5. For pairs with enough shared hashes, compute full distance */
-  size_t n_edges = 0, cap_edges = 0;
-  ReverbDupEdge *edges = NULL;
-
-  for (size_t i = 0; i < n_unique; i++) {
-    uint32_t a = candidates[i].win_a;
-    uint32_t b = candidates[i].win_b;
-
-    /* Filter out adjacent/overlapping windows on the same chromosome */
-    if (strcmp(coords[a].chrom, coords[b].chrom) == 0 &&
-        ABS_DIFF(coords[a].start, coords[b].start) < window_size)
-      continue;
-
-    if (candidates[i].shared_count < 2)
-      continue;
-
-    ReverbDistResult d = reverb_dist(&sketches[a], &sketches[b]);
-    if (d.distance < max_dist)
-      DA_PUSH(edges, n_edges, cap_edges, ((ReverbDupEdge){a, b, d.distance}));
+  if (n_edges == 0) {
+    free(edges);
+    edges = NULL;
   }
 
-  free(candidates);
   *out_edges = edges;
   return n_edges;
 }
@@ -677,28 +702,62 @@ static void do_pass2(char **files, int num_files, const Reverb *r,
   }
 }
 
+typedef struct {
+  uint32_t i, j;
+} SubclusterPair;
+
+typedef struct {
+  ReverbDupRegion *regions;
+  double max_dist;
+  size_t n_merged;
+  SubclusterPair **t_pairs;
+  size_t *t_n_pairs;
+  size_t *t_cap_pairs;
+} SubclusterData;
+
+static void subcluster_worker(void *data, long i, int tid) {
+  SubclusterData *w = (SubclusterData *)data;
+  if (w->regions[i].flank_sketch.sketch_size == 0)
+    return;
+  for (size_t j = i + 1; j < w->n_merged; j++) {
+    if (strcmp(w->regions[i].cluster_id, w->regions[j].cluster_id) != 0)
+      continue; // must be same cluster
+    if (w->regions[j].flank_sketch.sketch_size == 0)
+      continue;
+
+    ReverbDistResult d =
+        reverb_dist(&w->regions[i].flank_sketch, &w->regions[j].flank_sketch);
+    if (d.distance < w->max_dist) {
+      DA_PUSH(w->t_pairs[tid], w->t_n_pairs[tid], w->t_cap_pairs[tid],
+              ((SubclusterPair){(uint32_t)i, (uint32_t)j}));
+    }
+  }
+}
+
 static void do_subclustering(ReverbDupRegion *regions, size_t n_merged,
-                             double max_dist) {
+                             double max_dist, int n_threads) {
   UnionFind sub_uf;
   uf_init(&sub_uf, n_merged);
 
-  // N^2 comparison within the same family_id
-  for (size_t i = 0; i < n_merged; i++) {
-    if (regions[i].flank_sketch.sketch_size == 0)
-      continue;
-    for (size_t j = i + 1; j < n_merged; j++) {
-      if (strcmp(regions[i].cluster_id, regions[j].cluster_id) != 0)
-        continue; // must be same cluster
-      if (regions[j].flank_sketch.sketch_size == 0)
-        continue;
+  SubclusterData w;
+  w.regions = regions;
+  w.max_dist = max_dist;
+  w.n_merged = n_merged;
+  w.t_pairs = calloc(n_threads, sizeof(SubclusterPair *));
+  w.t_n_pairs = calloc(n_threads, sizeof(size_t));
+  w.t_cap_pairs = calloc(n_threads, sizeof(size_t));
 
-      ReverbDistResult d =
-          reverb_dist(&regions[i].flank_sketch, &regions[j].flank_sketch);
-      if (d.distance < max_dist) {
-        uf_union(&sub_uf, i, j);
-      }
+  kt_for(n_threads, subcluster_worker, &w, n_merged);
+
+  for (int t = 0; t < n_threads; t++) {
+    for (size_t k = 0; k < w.t_n_pairs[t]; k++) {
+      uf_union(&sub_uf, w.t_pairs[t][k].i, w.t_pairs[t][k].j);
     }
+    if (w.t_pairs[t]) free(w.t_pairs[t]);
   }
+  free(w.t_pairs);
+  free(w.t_n_pairs);
+  free(w.t_cap_pairs);
 
   // Map union-find parents to sub_cluster_id
   uint32_t *mapping = calloc(n_merged, sizeof(uint32_t));
@@ -1189,7 +1248,7 @@ int cmd_pangenome(int argc, char **argv, const char *pangenome_dir,
                   const char *rep_fasta, size_t flank_size, const Reverb *r,
                   uint64_t scale, size_t window_size, size_t step_size,
                   size_t min_bases, double max_dist, int min_copy, int max_copy,
-                  const char *out_prefix, const char *gff_file) {
+                  const char *out_prefix, const char *gff_file, int n_threads) {
   (void)argc;
   (void)argv;
 
@@ -1253,7 +1312,7 @@ int cmd_pangenome(int argc, char **argv, const char *pangenome_dir,
   fclose(bed_fp);
 
   size_t n_edges = build_candidate_edges(sketches, coords, num_sketches,
-                                         max_dist, window_size, &edges);
+                                         max_dist, window_size, n_threads, &edges);
 
   uint32_t *genome_id = calloc(num_sketches, sizeof(uint32_t));
   for (size_t i = 0; i < num_sketches; i++) {
@@ -1399,7 +1458,7 @@ int cmd_pangenome(int argc, char **argv, const char *pangenome_dir,
            flank_size == 0 ? window_size : flank_size);
 
   fprintf(stderr, "[reverb] Pass 2: Sub-clustering flanking sequences...\n");
-  do_subclustering(dup_regions, n_merged, max_dist);
+  do_subclustering(dup_regions, n_merged, max_dist, n_threads);
 
   // Output dup.bed
   snprintf(path_buf, sizeof(path_buf), "%s.dup.bed", out_prefix);
@@ -1624,7 +1683,6 @@ int cmd_dup(int argc, char **argv) {
 
   if (step_size == 0)
     step_size = window_size / 2;
-  (void)n_threads;
 
   if (!rep_fasta) {
     fprintf(stderr, "Error: -i <fasta> is required.\n");
@@ -1636,7 +1694,7 @@ int cmd_dup(int argc, char **argv) {
   r.hash_seed = def_hash_seed;
   return cmd_pangenome(argc, argv, pangenome_dir, rep_fasta, flank_size, &r,
                        def_scale, window_size, step_size, min_bases, max_dist,
-                       min_copy, max_copy, out_prefix, gff_file);
+                       min_copy, max_copy, out_prefix, gff_file, n_threads);
 }
 
 // ==============================================================
