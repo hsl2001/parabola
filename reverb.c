@@ -1169,7 +1169,10 @@ static TE *load_tes(const char *gff_file, size_t *num_tes) {
 
       TE te;
       memset(&te, 0, sizeof(TE));
-      snprintf(te.chrom, sizeof(te.chrom), "%s", parts[0]);
+      size_t chrom_len = strlen(parts[0]);
+      if (chrom_len >= sizeof(te.chrom)) chrom_len = sizeof(te.chrom) - 1;
+      memcpy(te.chrom, parts[0], chrom_len);
+      te.chrom[chrom_len] = '\0';
       te.start = strtoull(parts[3], NULL, 10);
       te.end = strtoull(parts[4], NULL, 10);
 
