@@ -54,9 +54,11 @@ typedef struct {
   char *chrom;
   size_t start;
   size_t end;
-  uint32_t family_id;
+  char *cluster_id;
   uint32_t copy_count;
   double avg_distance;
+  uint32_t subcluster_id;
+  ReverbSketch flank_sketch;
 } ReverbDupRegion;
 
 void reverb_init(Reverb *r, size_t hash_window);
