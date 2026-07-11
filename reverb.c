@@ -617,10 +617,10 @@ static int dup_stream_pangenome(const char *filename, const char *bname,
       WindowCoord *wc = &(*coords)[*num_sketches];
       memset(sk, 0, sizeof(ReverbSketch));
 
-      char namebuf[512];
-      snprintf(namebuf, sizeof(namebuf), "%s_%zu_%zu", chr_name, i,
-               i + window_size);
-      sk->name = strdup(namebuf);
+      size_t name_len = strlen(chr_name) + 64;
+      char *namebuf = malloc(name_len);
+      snprintf(namebuf, name_len, "%s_%zu_%zu", chr_name, i, i + window_size);
+      sk->name = namebuf;
       sk->kmer_size = r->hash_window;
       sk->hash_threshold = UINT64_MAX / scale;
 
@@ -1169,7 +1169,7 @@ static TE *load_tes(const char *gff_file, size_t *num_tes) {
 
       TE te;
       memset(&te, 0, sizeof(TE));
-      strncpy(te.chrom, parts[0], sizeof(te.chrom) - 1);
+      snprintf(te.chrom, sizeof(te.chrom), "%s", parts[0]);
       te.start = strtoull(parts[3], NULL, 10);
       te.end = strtoull(parts[4], NULL, 10);
 
@@ -1372,7 +1372,6 @@ int cmd_pangenome(int argc, char **argv, const char *pangenome_dir,
       uf_union(&uf, a, b);
     }
   }
-  free(genome_id);
 
   uint8_t *final_is_sd = calloc(num_sketches, sizeof(uint8_t));
   for (size_t i = 0; i < num_sketches; i++) {
@@ -1397,6 +1396,7 @@ int cmd_pangenome(int argc, char **argv, const char *pangenome_dir,
       }
     }
   }
+  free(genome_id);
 
   size_t n_dup_regions = 0, cap_dup_regions = 0;
   ReverbDupRegion *dup_regions = NULL;
@@ -1521,7 +1521,7 @@ int cmd_pangenome(int argc, char **argv, const char *pangenome_dir,
   for (int i = 0; i < num_files; i++) {
     char bname[256];
     get_basename(files[i], bname, sizeof(bname));
-    strncpy(gv[i].name, bname, 255);
+    snprintf(gv[i].name, sizeof(gv[i].name), "%s", bname);
     gv[i].vector = calloc(max_subcluster + 1, sizeof(uint8_t));
   }
   for (size_t i = 0; i < n_merged; i++) {
@@ -1604,10 +1604,12 @@ int cmd_pangenome(int argc, char **argv, const char *pangenome_dir,
     }
     if (!found) {
       seen[n_seen++] = cluster;
-      char svg_path[PATH_MAX];
-      snprintf(svg_path, sizeof(svg_path), "%s/%s.svg", dir_buf, cluster);
+      size_t svg_len = strlen(dir_buf) + strlen(cluster) + 6;
+      char *svg_path = malloc(svg_len);
+      snprintf(svg_path, svg_len, "%s/%s.svg", dir_buf, cluster);
       generate_svg(svg_path, dup_regions, n_merged, cluster, gv, num_files,
                    (const char **)chr_suffixes, num_chrs, chr_lengths);
+      free(svg_path);
     }
   }
   free(seen);
