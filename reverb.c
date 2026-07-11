@@ -458,10 +458,6 @@ static size_t merge_dup_regions(ReverbDupRegion *regions, size_t n) {
 }
 
 // ==============================================================
-// DUP: OUTPUT HELPERS
-// ==============================================================
-
-// ==============================================================
 // CMD: DUP
 // ==============================================================
 
@@ -1056,11 +1052,144 @@ int cmd_vis(int argc, char **argv) {
   return 0;
 }
 
+// ==============================================================
+// TE ANNOTATION
+// ==============================================================
+
+typedef struct {
+  char chrom[64];
+  size_t start;
+  size_t end;
+  char name[128];
+  char family[128];
+  char classification[128];
+} TE;
+
+static TE *load_tes(const char *gff_file, size_t *num_tes) {
+  FILE *f = fopen(gff_file, "r");
+  if (!f) {
+    fprintf(stderr, "[reverb] Warning: Could not open GFF file: %s\n",
+            gff_file);
+    *num_tes = 0;
+    return NULL;
+  }
+
+  size_t cap = 10000;
+  TE *tes = malloc(cap * sizeof(TE));
+  size_t count = 0;
+
+  char line[4096];
+  while (fgets(line, sizeof(line), f)) {
+    if (line[0] == '#')
+      continue;
+
+    char *parts[9];
+    int n_parts = 0;
+    char *p = line;
+    char *tab;
+    while ((tab = strchr(p, '\t')) != NULL && n_parts < 8) {
+      *tab = '\0';
+      parts[n_parts++] = p;
+      p = tab + 1;
+    }
+    parts[n_parts++] = p; // info column
+
+    if (n_parts < 9)
+      continue;
+
+    const char *ftype = parts[2];
+    if (strcmp(ftype, "mobile_element") == 0 ||
+        strcmp(ftype, "transposable_element") == 0 ||
+        strcmp(ftype, "repeat_region") == 0) {
+
+      TE te;
+      memset(&te, 0, sizeof(TE));
+      strncpy(te.chrom, parts[0], sizeof(te.chrom) - 1);
+      te.start = strtoull(parts[3], NULL, 10);
+      te.end = strtoull(parts[4], NULL, 10);
+
+      strcpy(te.name, "NA");
+      strcpy(te.family, "NA");
+      strcpy(te.classification, "NA");
+
+      char *info = parts[8];
+      char *item = strtok(info, ";\n");
+      while (item) {
+        if (strncmp(item, "Name=", 5) == 0) {
+          strncpy(te.name, item + 5, sizeof(te.name) - 1);
+        } else if (strncmp(item, "family_name=", 12) == 0) {
+          strncpy(te.family, item + 12, sizeof(te.family) - 1);
+        } else if (strncmp(item, "classification=", 15) == 0) {
+          strncpy(te.classification, item + 15, sizeof(te.classification) - 1);
+        }
+        item = strtok(NULL, ";\n");
+      }
+
+      if (count >= cap) {
+        cap *= 2;
+        tes = realloc(tes, cap * sizeof(TE));
+      }
+      tes[count++] = te;
+    }
+  }
+  fclose(f);
+
+  *num_tes = count;
+  fprintf(stderr, "[reverb] Loaded %zu TEs from %s\n", count, gff_file);
+  return tes;
+}
+
+static TE *annotate_cluster(const char *cluster_id, TE *tes, size_t num_tes) {
+  if (!tes || num_tes == 0)
+    return NULL;
+
+  char chrom[64];
+  size_t c_start = 0, c_end = 0;
+
+  // Parse cluster_id: e.g., TAIR12_1Feb26-Chr1@1465000-1470000
+  const char *at = strchr(cluster_id, '@');
+  if (!at)
+    return NULL;
+
+  const char *dash = at;
+  while (dash > cluster_id && *dash != '-')
+    dash--;
+  if (*dash != '-')
+    return NULL;
+
+  size_t chrom_len = at - dash - 1;
+  if (chrom_len >= sizeof(chrom))
+    chrom_len = sizeof(chrom) - 1;
+  strncpy(chrom, dash + 1, chrom_len);
+  chrom[chrom_len] = '\0';
+
+  sscanf(at + 1, "%zu-%zu", &c_start, &c_end);
+
+  size_t max_overlap = 0;
+  TE *best_te = NULL;
+
+  for (size_t i = 0; i < num_tes; i++) {
+    if (strcmp(tes[i].chrom, chrom) == 0) {
+      if (tes[i].start <= c_end && tes[i].end >= c_start) {
+        size_t o_start = (c_start > tes[i].start) ? c_start : tes[i].start;
+        size_t o_end = (c_end < tes[i].end) ? c_end : tes[i].end;
+        size_t overlap = o_end - o_start + 1;
+        if (overlap > max_overlap) {
+          max_overlap = overlap;
+          best_te = &tes[i];
+        }
+      }
+    }
+  }
+
+  return best_te;
+}
+
 int cmd_pangenome(int argc, char **argv, const char *pangenome_dir,
                   const char *rep_fasta, size_t flank_size, const Reverb *r,
                   uint64_t scale, size_t window_size, size_t step_size,
                   size_t min_bases, double max_dist, int min_copy, int max_copy,
-                  const char *out_prefix) {
+                  const char *out_prefix, const char *gff_file) {
   (void)argc;
   (void)argv;
 
@@ -1275,16 +1404,52 @@ int cmd_pangenome(int argc, char **argv, const char *pangenome_dir,
   // Output dup.bed
   snprintf(path_buf, sizeof(path_buf), "%s.dup.bed", out_prefix);
   FILE *out_bed = fopen(path_buf, "w");
-  fprintf(out_bed, "#chrom\tstart\tend\tcluster_id\tsubcluster_id\n");
+
+  size_t num_tes = 0;
+  TE *tes = NULL;
+  if (gff_file) {
+    tes = load_tes(gff_file, &num_tes);
+    fprintf(out_bed, "#chrom\tstart\tend\tcluster_id\tsubcluster_"
+                     "id\tName\tfamily_name\tclassification\n");
+  } else {
+    fprintf(out_bed, "#chrom\tstart\tend\tcluster_id\tsubcluster_id\n");
+  }
+
+  char rep_bname[256];
+  get_basename(rep_fasta, rep_bname, sizeof(rep_bname));
+  size_t rep_len = strlen(rep_bname);
+
   uint32_t max_subcluster = 0;
   for (size_t i = 0; i < n_merged; i++) {
-    fprintf(out_bed, "%s\t%zu\t%zu\t%s\t%u\n", dup_regions[i].chrom,
-            dup_regions[i].start, dup_regions[i].end, dup_regions[i].cluster_id,
-            dup_regions[i].subcluster_id);
+    if (gff_file) {
+      TE *best_te = annotate_cluster(dup_regions[i].cluster_id, tes, num_tes);
+      if (best_te) {
+        int is_rep = (strncmp(dup_regions[i].chrom, rep_bname, rep_len) == 0 &&
+                      (dup_regions[i].chrom[rep_len] == '-' ||
+                       dup_regions[i].chrom[rep_len] == '\0'));
+        const char *out_name = is_rep ? best_te->name : "NA";
+
+        fprintf(out_bed, "%s\t%zu\t%zu\t%s\t%u\t%s\t%s\t%s\n",
+                dup_regions[i].chrom, dup_regions[i].start, dup_regions[i].end,
+                dup_regions[i].cluster_id, dup_regions[i].subcluster_id,
+                out_name, best_te->family, best_te->classification);
+      } else {
+        fprintf(out_bed, "%s\t%zu\t%zu\t%s\t%u\tNA\tNA\tNA\n",
+                dup_regions[i].chrom, dup_regions[i].start, dup_regions[i].end,
+                dup_regions[i].cluster_id, dup_regions[i].subcluster_id);
+      }
+    } else {
+      fprintf(out_bed, "%s\t%zu\t%zu\t%s\t%u\n", dup_regions[i].chrom,
+              dup_regions[i].start, dup_regions[i].end,
+              dup_regions[i].cluster_id, dup_regions[i].subcluster_id);
+    }
+
     if (dup_regions[i].subcluster_id > max_subcluster)
       max_subcluster = dup_regions[i].subcluster_id;
   }
   fclose(out_bed);
+  if (tes)
+    free(tes);
 
   // Sort genomes for SVG
   GenomeVector *gv = calloc(num_files, sizeof(GenomeVector));
@@ -1395,6 +1560,11 @@ int cmd_pangenome(int argc, char **argv, const char *pangenome_dir,
 }
 
 int cmd_dup(int argc, char **argv) {
+
+  // ==============================================================
+  // CLI defaults
+  // ==============================================================
+
   uint32_t def_kmer_size = 21;
   uint64_t def_scale = 10;
   uint64_t def_hash_seed = 42;
@@ -1407,13 +1577,14 @@ int cmd_dup(int argc, char **argv) {
   const char *out_prefix = "reverb";
   const char *pangenome_dir = NULL;
   const char *rep_fasta = NULL;
+  const char *gff_file = NULL;
   size_t flank_size = 0;
   int n_threads = 8;
 
   ketopt_t opt = KETOPT_INIT;
   int c;
   while ((c = ketopt(&opt, argc, argv, 1,
-                     "k:s:e:w:t:b:d:m:M:o:p:hI:i:f:", 0)) >= 0) {
+                     "k:s:e:w:t:b:d:m:M:o:p:hI:i:f:g:", 0)) >= 0) {
     if (c == 'h') {
       print_usage();
       return 0;
@@ -1445,6 +1616,8 @@ int cmd_dup(int argc, char **argv) {
       rep_fasta = opt.arg;
     else if (c == 'f')
       flank_size = (size_t)strtoull(opt.arg, NULL, 10);
+    else if (c == 'g')
+      gff_file = opt.arg;
     else
       return 1;
   }
@@ -1463,7 +1636,7 @@ int cmd_dup(int argc, char **argv) {
   r.hash_seed = def_hash_seed;
   return cmd_pangenome(argc, argv, pangenome_dir, rep_fasta, flank_size, &r,
                        def_scale, window_size, step_size, min_bases, max_dist,
-                       min_copy, max_copy, out_prefix);
+                       min_copy, max_copy, out_prefix, gff_file);
 }
 
 // ==============================================================

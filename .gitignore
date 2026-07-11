@@ -4,3 +4,4 @@ parabola
 tmp*
 *.fasta
 *.bin
+*.bed*
