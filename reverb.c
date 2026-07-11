@@ -20,6 +20,18 @@
     (arr)[(n)++] = (val);                                                      \
   } while (0)
 
+#define CMP(a, b) (((a) > (b)) - ((a) < (b)))
+#define SWAP(type, a, b)                                                       \
+  do {                                                                         \
+    type _t = (a);                                                             \
+    (a) = (b);                                                                 \
+    (b) = _t;                                                                  \
+  } while (0)
+#define VALID_COPY(cc, min, max)                                               \
+  ((int)(cc) >= (min) && ((max) <= 0 || (int)(cc) <= (max)))
+#define LBL(lbl) ((lbl) ? (lbl) : "unknown")
+#define ABS_DIFF(a, b) ((a) > (b) ? (a) - (b) : (b) - (a))
+
 KSEQ_INIT(gzFile, gzread)
 
 // ==============================================================
@@ -96,9 +108,7 @@ typedef struct {
 } HashPool;
 
 static int cmp_uint64(const void *a, const void *b) {
-  uint64_t x = *(const uint64_t *)a;
-  uint64_t y = *(const uint64_t *)b;
-  return (x > y) - (x < y);
+  return CMP(*(const uint64_t *)a, *(const uint64_t *)b);
 }
 
 static void pool_init(HashPool *pool, uint64_t threshold) {
@@ -200,9 +210,8 @@ ReverbDistResult reverb_dist(const ReverbSketch *ref,
 
   res.shared_hashes = shared;
   if (ref->sketch_size > 0 && query->sketch_size > 0) {
-    double ca = (double)shared / (double)ref->sketch_size;
-    double cb = (double)shared / (double)query->sketch_size;
-    res.containment = 0.5 * (ca + cb);
+    res.containment =
+        0.5 * shared * (1.0 / ref->sketch_size + 1.0 / query->sketch_size);
     res.distance = 1.0 - pow(res.containment, 1.0 / (double)ref->kmer_size);
   }
   return res;
@@ -233,11 +242,8 @@ void uf_union(UnionFind *uf, uint32_t a, uint32_t b) {
   b = uf_find(uf, b);
   if (a == b)
     return;
-  if (uf->rank[a] < uf->rank[b]) {
-    uint32_t t = a;
-    a = b;
-    b = t;
-  }
+  if (uf->rank[a] < uf->rank[b])
+    SWAP(uint32_t, a, b);
   uf->parent[b] = a;
   if (uf->rank[a] == uf->rank[b])
     uf->rank[a]++;
@@ -363,11 +369,10 @@ static int dup_stream(const char *filename, const Reverb *r, uint64_t scale,
 // ==============================================================
 
 static int cmp_hash_window_entry(const void *a, const void *b) {
-  const HashWindowEntry *ea = (const HashWindowEntry *)a;
-  const HashWindowEntry *eb = (const HashWindowEntry *)b;
-  if (ea->hash != eb->hash)
-    return (ea->hash > eb->hash) - (ea->hash < eb->hash);
-  return (ea->window_id > eb->window_id) - (ea->window_id < eb->window_id);
+  const HashWindowEntry *ea = (const HashWindowEntry *)a,
+                        *eb = (const HashWindowEntry *)b;
+  return ea->hash != eb->hash ? CMP(ea->hash, eb->hash)
+                              : CMP(ea->window_id, eb->window_id);
 }
 
 typedef struct {
@@ -377,13 +382,10 @@ typedef struct {
 } CandidatePair;
 
 static int cmp_candidate_pair(const void *a, const void *b) {
-  const CandidatePair *pa = (const CandidatePair *)a;
-  const CandidatePair *pb = (const CandidatePair *)b;
-  if (pa->win_a != pb->win_a)
-    return (pa->win_a < pb->win_a) ? -1 : 1;
-  if (pa->win_b != pb->win_b)
-    return (pa->win_b < pb->win_b) ? -1 : 1;
-  return 0;
+  const CandidatePair *pa = (const CandidatePair *)a,
+                      *pb = (const CandidatePair *)b;
+  return pa->win_a != pb->win_a ? CMP(pa->win_a, pb->win_a)
+                                : CMP(pa->win_b, pb->win_b);
 }
 
 /* Build inverted hash index and find candidate pairs.
@@ -434,11 +436,8 @@ static size_t build_candidate_edges(ReverbSketch *sketches, WindowCoord *coords,
           uint32_t b = entries[j].window_id;
           if (a == b)
             continue;
-          if (a > b) {
-            uint32_t t = a;
-            a = b;
-            b = t;
-          }
+          if (a > b)
+            SWAP(uint32_t, a, b);
           DA_PUSH(candidates, n_candidates, cap_candidates,
                   ((CandidatePair){a, b, 1}));
         }
@@ -475,13 +474,9 @@ static size_t build_candidate_edges(ReverbSketch *sketches, WindowCoord *coords,
     uint32_t b = candidates[i].win_b;
 
     /* Filter out adjacent/overlapping windows on the same chromosome */
-    if (strcmp(coords[a].chrom, coords[b].chrom) == 0) {
-      size_t dist_bp = (coords[a].start < coords[b].start)
-                           ? coords[b].start - coords[a].start
-                           : coords[a].start - coords[b].start;
-      if (dist_bp < window_size)
-        continue;
-    }
+    if (strcmp(coords[a].chrom, coords[b].chrom) == 0 &&
+        ABS_DIFF(coords[a].start, coords[b].start) < window_size)
+      continue;
 
     if (candidates[i].shared_count < 2)
       continue;
@@ -501,12 +496,10 @@ static size_t build_candidate_edges(ReverbSketch *sketches, WindowCoord *coords,
 // ==============================================================
 
 static int cmp_dup_region(const void *a, const void *b) {
-  const ReverbDupRegion *ra = (const ReverbDupRegion *)a;
-  const ReverbDupRegion *rb = (const ReverbDupRegion *)b;
+  const ReverbDupRegion *ra = (const ReverbDupRegion *)a,
+                        *rb = (const ReverbDupRegion *)b;
   int c = strcmp(ra->chrom, rb->chrom);
-  if (c != 0)
-    return c;
-  return (ra->start > rb->start) - (ra->start < rb->start);
+  return c ? c : CMP(ra->start, rb->start);
 }
 
 /* Merge adjacent/overlapping regions in the same SD family.
@@ -540,15 +533,10 @@ static size_t merge_dup_regions(ReverbDupRegion *regions, size_t n) {
 // ==============================================================
 
 static int cmp_edge_for_bedpe(const void *p1, const void *p2) {
-  const ReverbDupEdge *e1 = (const ReverbDupEdge *)p1;
-  const ReverbDupEdge *e2 = (const ReverbDupEdge *)p2;
-  if (e1->win_a != e2->win_a)
-    return (e1->win_a < e2->win_a) ? -1 : 1;
-  if (e1->distance < e2->distance)
-    return -1;
-  if (e1->distance > e2->distance)
-    return 1;
-  return 0;
+  const ReverbDupEdge *e1 = (const ReverbDupEdge *)p1,
+                      *e2 = (const ReverbDupEdge *)p2;
+  return e1->win_a != e2->win_a ? CMP(e1->win_a, e2->win_a)
+                                : CMP(e1->distance, e2->distance);
 }
 
 static size_t write_bedpe_output(const char *path, ReverbDupEdge *edges,
@@ -577,9 +565,9 @@ static size_t write_bedpe_output(const char *path, ReverbDupEdge *edges,
 
     uint32_t fam = uf_find(uf, a);
     uint32_t cc = copy_counts[fam];
-    if ((int)cc < min_copy || (max_copy > 0 && (int)cc > max_copy))
+    if (!VALID_COPY(cc, min_copy, max_copy))
       continue;
-    const char *label = hub_label[fam] ? hub_label[fam] : "unknown";
+    const char *label = LBL(hub_label[fam]);
     fprintf(fp, "%s\t%zu\t%zu\t%s\t%zu\t%zu\t%s\t%.6f\t%u\n", coords[a].chrom,
             coords[a].start, coords[a].end, coords[b].chrom, coords[b].start,
             coords[b].end, label, edges[i].distance, cc);
@@ -605,23 +593,34 @@ static BedOutputStats write_bed_output(const char *path,
     return stats;
   }
 
-  fprintf(fp, "#chrom\tstart\tend\tfamily\tcopy_count\n");
-  uint32_t last_fam = UINT32_MAX;
+  uint32_t max_fam = 0;
   for (size_t i = 0; i < n_merged; i++) {
-    if ((int)regions[i].copy_count < min_copy ||
-        (max_copy > 0 && (int)regions[i].copy_count > max_copy))
+    if (regions[i].family_id > max_fam)
+      max_fam = regions[i].family_id;
+  }
+
+  uint8_t *seen = calloc(max_fam + 1, sizeof(uint8_t));
+  if (!seen && max_fam > 0) {
+    fprintf(stderr, "Error: memory allocation failed in write_bed_output\n");
+    fclose(fp);
+    return stats;
+  }
+
+  fprintf(fp, "#chrom\tstart\tend\tfamily\tcopy_count\n");
+  for (size_t i = 0; i < n_merged; i++) {
+    if (!VALID_COPY(regions[i].copy_count, min_copy, max_copy))
       continue;
-    const char *label = hub_label[regions[i].family_id]
-                            ? hub_label[regions[i].family_id]
-                            : "unknown";
+    const char *label = LBL(hub_label[regions[i].family_id]);
     fprintf(fp, "%s\t%zu\t%zu\t%s\t%u\n", regions[i].chrom, regions[i].start,
             regions[i].end, label, regions[i].copy_count);
-    if (regions[i].family_id != last_fam) {
+    if (!seen || !seen[regions[i].family_id]) {
       stats.n_families++;
-      last_fam = regions[i].family_id;
+      if (seen)
+        seen[regions[i].family_id] = 1;
     }
     stats.n_output++;
   }
+  free(seen);
   fclose(fp);
   return stats;
 }
@@ -847,20 +846,18 @@ int cmd_dup(int argc, char **argv) {
                 bed_stats.n_families, bed_stats.n_output, elapsed, out_prefix);
 
 cleanup:
-  free(edges);
-  free(dup_regions);
-  free(comp_size);
-  if (hub_label) {
-    for (size_t i = 0; i < num_sketches; i++)
-      free(hub_label[i]);
-    free(hub_label);
-  }
-  if (uf.parent)
-    uf_free(&uf);
   for (size_t i = 0; i < num_sketches; i++) {
+    if (hub_label)
+      free(hub_label[i]);
     reverb_sketch_free(&sketches[i]);
     free(coords[i].chrom);
   }
+  free(edges);
+  free(dup_regions);
+  free(comp_size);
+  free(hub_label);
+  if (uf.parent)
+    uf_free(&uf);
   free(sketches);
   free(coords);
 
