@@ -15,7 +15,8 @@ void kt_for(int n_threads, void (*func)(void *, long, int), void *data, long n);
 /* Generic dynamic-array push: grows `arr` by doubling `cap` as needed. */
 #define DA_PUSH(arr, n, cap, val)                                              \
   do {                                                                         \
-    if ((n) >= (cap)) {                                                        \
+  /* If exceed capacity */                                                     \
+  if ((n) >= (cap)) {                                                          \
       (cap) = (cap) ? (cap) * 2 : 1024;                                        \
       (arr) = realloc((arr), (cap) * sizeof(*(arr)));                          \
     }                                                                          \
@@ -32,6 +33,7 @@ void kt_for(int n_threads, void (*func)(void *, long, int), void *data, long n);
 
 #define ABS_DIFF(a, b) ((a) > (b) ? (a) - (b) : (b) - (a))
 
+/* Reader initiation */
 KSEQ_INIT(gzFile, gzread)
 
 // ==============================================================
@@ -62,10 +64,12 @@ static uint64_t mix_hash(__uint128_t hash_value, uint64_t seed) {
 
 static uint64_t reverse_bits64(uint64_t n) {
 #if defined(__aarch64__)
+  /* reverse bits (rbits) asm command for ARM chips */
   uint64_t r;
   __asm__("rbit %0, %1" : "=r"(r) : "r"(n));
   return r;
 #else
+  /* manually reverse bits for x86_64 chips */
   uint64_t r = __builtin_bswap64(n);
   r = ((r & 0x5555555555555555ULL) << 1) | ((r & 0xAAAAAAAAAAAAAAAAULL) >> 1);
   r = ((r & 0x3333333333333333ULL) << 2) | ((r & 0xCCCCCCCCCCCCCCCCULL) >> 2);
@@ -89,11 +93,12 @@ void reverb_init(Reverb *r, size_t hash_window) {
 
   __uint128_t remover_mask =
       (kmer_bits > 3) ? (((__uint128_t)1 << (kmer_bits - 3)) - 1) : 0;
+  /* remover mask to forget previous base */
 
   r->hash_window = k;
   r->remover_mask = remover_mask;
   r->kmer_bits = kmer_bits;
-  r->rc_shift = (kmer_bits > 0) ? (128 - kmer_bits) : 128;
+  r->rc_shift = (kmer_bits > 0) ? (128 - kmer_bits) : 128; /* reverse_complement shift */
 }
 
 // ==============================================================
@@ -101,12 +106,13 @@ void reverb_init(Reverb *r, size_t hash_window) {
 // ==============================================================
 
 typedef struct {
-  size_t size;
-  size_t cap;
-  uint64_t hash_threshold;
+  size_t size; /* ?????????? */
+  size_t cap; /* ?????????? */
+  uint64_t hash_threshold; /* FracMinHash threshold */
   uint64_t *hashes;
 } HashPool;
 
+/* Wrapper for macro to use in `qsort`*/
 static int cmp_uint64(const void *a, const void *b) {
   return CMP(*(const uint64_t *)a, *(const uint64_t *)b);
 }
@@ -147,6 +153,8 @@ static void pool_finalize(HashPool *pool, uint64_t **out_hashes,
 // SKETCH EXTRACTION
 // ==============================================================
 
+/* Extract reverb hash and insert in HashPool */
+/* Hot spot code */
 __attribute__((hot)) static void extract_and_insert(const Reverb *r,
                                                     HashPool *pool,
                                                     const uint8_t *seq,
@@ -156,6 +164,7 @@ __attribute__((hot)) static void extract_and_insert(const Reverb *r,
   size_t valid = 0;
 
   for (size_t idx = 0; idx < len; idx++) {
+    /* Convert to numerical values */
     int8_t lv = BASE_LOOKUP[seq[idx]];
     if (lv < 0) {
       fwd = 0;
@@ -163,16 +172,21 @@ __attribute__((hot)) static void extract_and_insert(const Reverb *r,
       continue;
     }
 
+    /* Concat for fwd hash */
     fwd = ((fwd & r->remover_mask) << 3) | (uint8_t)lv;
     if (valid < K)
       valid++;
     if (valid < K)
       continue;
 
+    /* Reverse bits for reverse complement */
     __uint128_t rev = reverse_bits128(fwd) >> r->rc_shift;
+    /* Min operation to canonicalize */
     __uint128_t canon = fwd < rev ? fwd : rev;
+    /* Mix hash to avoid collision */
     uint64_t h = mix_hash(canon, r->hash_seed);
 
+    /* FracMinHash */
     if (h < pool->hash_threshold)
       pool_try_insert(pool, h);
   }
@@ -188,11 +202,14 @@ void reverb_sketch_free(ReverbSketch *sk) {
 // DISTANCE CALCULATION
 // ==============================================================
 
+/* Calculate distance between two sketch sets */
 ReverbDistResult reverb_dist(const ReverbSketch *ref, const ReverbSketch *query,
                              uint32_t kmer_size) {
   ReverbDistResult res = {0.0, 1.0, 0};
 
   size_t shared = 0, i = 0, j = 0;
+
+  /* Set opperations */
   while (i < ref->sketch_size && j < query->sketch_size) {
     if (ref->hashes[i] == query->hashes[j]) {
       shared++;
@@ -205,6 +222,7 @@ ReverbDistResult reverb_dist(const ReverbSketch *ref, const ReverbSketch *query,
     }
   }
 
+  /* Calculate distance with containment method */
   res.shared_hashes = shared;
   if (ref->sketch_size > 0 && query->sketch_size > 0) {
     res.containment =
@@ -216,6 +234,7 @@ ReverbDistResult reverb_dist(const ReverbSketch *ref, const ReverbSketch *query,
 
 // ==============================================================
 // UNION-FIND
+// Union-find algorithm to determine two nodes are in same set or not
 // ==============================================================
 
 void uf_init(UnionFind *uf, size_t n) {
@@ -255,8 +274,6 @@ void uf_free(UnionFind *uf) {
 // PARAMETERS
 // ==============================================================
 
-// Params removed, handled directly in cmd_dup
-
 static void print_usage(void) {
   printf("Reverb: Ultra-fast Alignment-free Segmental Duplication Detection\n\n"
          "Usage: reverb [options] fasta1 [fasta2 ...]\n\n"
@@ -276,7 +293,7 @@ static void print_usage(void) {
 }
 
 // ==============================================================
-// DUP: WINDOW STREAMING
+// WINDOW STREAMING
 // ==============================================================
 
 typedef struct {
@@ -292,7 +309,7 @@ typedef struct {
 } HashWindowEntry;
 
 // ==============================================================
-// DUP: INVERTED HASH INDEX
+// INVERTED HASH INDEX
 // ==============================================================
 
 static int cmp_hash_window_entry(const void *a, const void *b) {

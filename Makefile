@@ -9,6 +9,9 @@ SRCS = reverb.c klib/kthread.c
 $(TARGET): $(SRCS)
 	$(CC) $(CFLAGS) -o $(TARGET) $(SRCS) $(LDFLAGS)
 
+all: $(SRCS)
+	$(CC) $(CFLAGS) -o $(TARGET) $(SRCS) $(LDFLAGS)
+
 static: $(SRCS)
 	$(CC) $(CFLAGS) -static -o $(TARGET) $(SRCS) $(LDFLAGS)
 
