@@ -1487,7 +1487,7 @@ int cmd_pangenome(int argc, char **argv, const char *pangenome_dir,
 
   fprintf(stderr, "[reverb] Pass 2: Extracting flanking sequences...\n");
   do_pass2(files, num_files, r, scale, dup_regions, n_merged,
-           flank_size == 0 ? window_size / 5 : flank_size);
+           flank_size == 0 ? window_size : flank_size);
 
   fprintf(stderr, "[reverb] Pass 2: Sub-clustering flanking sequences...\n");
   do_subclustering(dup_regions, n_merged, max_dist, n_threads, r->hash_window);
