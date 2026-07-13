@@ -1,10 +1,10 @@
+#include <fcntl.h>
 #include <math.h>
 #include <stdio.h>
-#include <time.h>
-#include <zlib.h>
 #include <sys/mman.h>
-#include <fcntl.h>
+#include <time.h>
 #include <unistd.h>
+#include <zlib.h>
 
 #include "klib/ketopt.h"
 #include "klib/khash.h"
@@ -159,11 +159,11 @@ static void pool_finalize(HashPool *pool, uint64_t **out_hashes,
 // ==============================================================
 
 typedef struct {
-  FILE *fp;              /* Write handle (NULL after finalize) */
-  char path[PATH_MAX];   /* Temp file path */
-  size_t file_size;      /* Total bytes written */
-  uint64_t *mmap_base;   /* mmap'd region after finalize */
-  int fd;                /* File descriptor for mmap */
+  FILE *fp;            /* Write handle (NULL after finalize) */
+  char path[PATH_MAX]; /* Temp file path */
+  size_t file_size;    /* Total bytes written */
+  uint64_t *mmap_base; /* mmap'd region after finalize */
+  int fd;              /* File descriptor for mmap */
 } SketchStore;
 
 static void skstore_init(SketchStore *ss, const char *prefix) {
@@ -195,8 +195,8 @@ static void skstore_finalize(SketchStore *ss) {
   if (ss->file_size > 0) {
     ss->fd = open(ss->path, O_RDONLY);
     if (ss->fd >= 0) {
-      ss->mmap_base = mmap(NULL, ss->file_size, PROT_READ, MAP_SHARED,
-                           ss->fd, 0);
+      ss->mmap_base =
+          mmap(NULL, ss->file_size, PROT_READ, MAP_SHARED, ss->fd, 0);
       if (ss->mmap_base == MAP_FAILED) {
         fprintf(stderr, "[reverb] Warning: mmap failed\n");
         ss->mmap_base = NULL;
@@ -375,8 +375,8 @@ typedef struct {
   uint32_t seq_id;
   size_t start;
   size_t end;
-  size_t sketch_offset;  /* byte offset in SketchStore */
-  uint32_t sketch_size;  /* number of hashes */
+  size_t sketch_offset; /* byte offset in SketchStore */
+  uint32_t sketch_size; /* number of hashes */
 } WindowCoord;
 
 /* Inverted hash index entry: maps a hash value to its source window */
@@ -430,9 +430,8 @@ static void edge_worker(void *data, long i, int tid) {
   EdgeWorkerData *w = (EdgeWorkerData *)data;
   uint32_t a = (uint32_t)i;
 
-  const uint64_t *a_hashes =
-      skstore_get(w->store, w->coords[a].sketch_offset,
-                  w->coords[a].sketch_size);
+  const uint64_t *a_hashes = skstore_get(w->store, w->coords[a].sketch_offset,
+                                         w->coords[a].sketch_size);
 
   khash_t(u32) *counts = kh_init(u32);
   int ret;
@@ -498,10 +497,9 @@ static void edge_worker(void *data, long i, int tid) {
  * Returns edges where distance < max_dist, excluding adjacent windows
  * on the same chromosome. */
 static size_t build_candidate_edges(const SketchStore *store,
-                                    WindowCoord *coords,
-                                    size_t n_windows, double max_dist,
-                                    size_t window_size, int n_threads,
-                                    uint32_t kmer_size,
+                                    WindowCoord *coords, size_t n_windows,
+                                    double max_dist, size_t window_size,
+                                    int n_threads, uint32_t kmer_size,
                                     ReverbDupEdge **out_edges,
                                     const char *out_prefix) {
   /* 1. Flatten all (hash, window_id) entries */
@@ -531,8 +529,8 @@ static size_t build_candidate_edges(const SketchStore *store,
     const uint64_t *hashes =
         skstore_get(store, coords[i].sketch_offset, coords[i].sketch_size);
     for (uint32_t j = 0; j < coords[i].sketch_size; j++) {
-      entries[idx++] = (HashWindowEntry){.hash = hashes[j],
-                                         .window_id = (uint32_t)i};
+      entries[idx++] =
+          (HashWindowEntry){.hash = hashes[j], .window_id = (uint32_t)i};
     }
   }
 
@@ -705,14 +703,11 @@ typedef struct {
   size_t length;
 } GenomeSeqLen;
 
-static int dup_stream_pangenome(const char *filename, const char *bname,
-                                const Reverb *r, uint64_t scale,
-                                size_t window_size, size_t step_size,
-                                size_t min_bases, SketchStore *store,
-                                WindowCoord **coords, size_t *num_sketches,
-                                size_t *cap_sketches, FILE *bed_fp,
-                                GenomeSeqLen **seq_lens, size_t *num_seqs,
-                                size_t *cap_seqs) {
+static int dup_stream_pangenome(
+    const char *filename, const char *bname, const Reverb *r, uint64_t scale,
+    size_t window_size, size_t step_size, size_t min_bases, SketchStore *store,
+    WindowCoord **coords, size_t *num_sketches, size_t *cap_sketches,
+    FILE *bed_fp, GenomeSeqLen **seq_lens, size_t *num_seqs, size_t *cap_seqs) {
   gzFile fp = gzopen(filename, "r");
   if (!fp)
     return -1;
@@ -1463,10 +1458,9 @@ int cmd_pangenome(int argc, char **argv, const char *pangenome_dir,
   fprintf(stderr, "[reverb] Sketches stored on disk: %.1f MB (%zu windows)\n",
           sketch_store.file_size / (1024.0 * 1024.0), num_sketches);
 
-  size_t n_edges =
-      build_candidate_edges(&sketch_store, coords, num_sketches, max_dist,
-                            window_size, n_threads, r->hash_window, &edges,
-                            out_prefix);
+  size_t n_edges = build_candidate_edges(&sketch_store, coords, num_sketches,
+                                         max_dist, window_size, n_threads,
+                                         r->hash_window, &edges, out_prefix);
 
   uint32_t *genome_id = calloc(num_sketches, sizeof(uint32_t));
   for (size_t i = 0; i < num_sketches; i++) {
@@ -1799,7 +1793,7 @@ int cmd_dup(int argc, char **argv) {
   size_t window_size = 5000;
   size_t step_size = 0; /* 0 = auto (window/2) */
   size_t min_bases = 1000;
-  double max_dist = 0.05;
+  double max_dist = 0.03;
   int min_copy = 3;
   int max_copy = 30;
   const char *out_prefix = "reverb";
