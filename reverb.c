@@ -15,8 +15,8 @@ void kt_for(int n_threads, void (*func)(void *, long, int), void *data, long n);
 /* Generic dynamic-array push: grows `arr` by doubling `cap` as needed. */
 #define DA_PUSH(arr, n, cap, val)                                              \
   do {                                                                         \
-  /* If exceed capacity */                                                     \
-  if ((n) >= (cap)) {                                                          \
+    /* If exceed capacity */                                                   \
+    if ((n) >= (cap)) {                                                        \
       (cap) = (cap) ? (cap) * 2 : 1024;                                        \
       (arr) = realloc((arr), (cap) * sizeof(*(arr)));                          \
     }                                                                          \
@@ -98,7 +98,8 @@ void reverb_init(Reverb *r, size_t hash_window) {
   r->hash_window = k;
   r->remover_mask = remover_mask;
   r->kmer_bits = kmer_bits;
-  r->rc_shift = (kmer_bits > 0) ? (128 - kmer_bits) : 128; /* reverse_complement shift */
+  r->rc_shift =
+      (kmer_bits > 0) ? (128 - kmer_bits) : 128; /* reverse_complement shift */
 }
 
 // ==============================================================
@@ -106,8 +107,8 @@ void reverb_init(Reverb *r, size_t hash_window) {
 // ==============================================================
 
 typedef struct {
-  size_t size; /* ?????????? */
-  size_t cap; /* ?????????? */
+  size_t size;             /* ?????????? */
+  size_t cap;              /* ?????????? */
   uint64_t hash_threshold; /* FracMinHash threshold */
   uint64_t *hashes;
 } HashPool;
@@ -1486,7 +1487,7 @@ int cmd_pangenome(int argc, char **argv, const char *pangenome_dir,
 
   fprintf(stderr, "[reverb] Pass 2: Extracting flanking sequences...\n");
   do_pass2(files, num_files, r, scale, dup_regions, n_merged,
-           flank_size == 0 ? window_size : flank_size);
+           flank_size == 0 ? window_size / 5 : flank_size);
 
   fprintf(stderr, "[reverb] Pass 2: Sub-clustering flanking sequences...\n");
   do_subclustering(dup_regions, n_merged, max_dist, n_threads, r->hash_window);
@@ -1670,7 +1671,7 @@ int cmd_dup(int argc, char **argv) {
   const char *pangenome_dir = NULL;
   const char *rep_fasta = NULL;
   const char *gff_file = NULL;
-  size_t flank_size = 0;
+  size_t flank_size = 0; /* 0 = auto (window/5) */
   int n_threads = 8;
 
   ketopt_t opt = KETOPT_INIT;
