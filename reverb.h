@@ -34,14 +34,14 @@ typedef struct {
 
 /* Edge in the duplication graph */
 typedef struct {
-  uint64_t win_a;
-  uint64_t win_b;
+  uint32_t win_a;
+  uint32_t win_b;
   double distance;
 } ReverbDupEdge;
 
 typedef struct {
-  uint64_t *parent;
-  uint64_t *rank;
+  uint32_t *parent;
+  uint32_t *rank;
   size_t n;
 } UnionFind;
 
@@ -64,8 +64,8 @@ ReverbDistResult reverb_dist(const ReverbSketch *ref,
 
 /* Union-Find operations */
 void uf_init(UnionFind *uf, size_t n);
-uint64_t uf_find(UnionFind *uf, uint64_t x);
-void uf_union(UnionFind *uf, uint64_t a, uint64_t b);
+uint32_t uf_find(UnionFind *uf, uint32_t x);
+void uf_union(UnionFind *uf, uint32_t a, uint32_t b);
 void uf_free(UnionFind *uf);
 
 #ifdef __cplusplus

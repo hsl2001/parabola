@@ -2,8 +2,12 @@
 #include <stdio.h>
 #include <time.h>
 #include <zlib.h>
+#include <sys/mman.h>
+#include <fcntl.h>
+#include <unistd.h>
 
 #include "klib/ketopt.h"
+#include "klib/khash.h"
 #include "klib/kseq.h"
 #include "reverb.h"
 
@@ -151,6 +155,76 @@ static void pool_finalize(HashPool *pool, uint64_t **out_hashes,
 }
 
 // ==============================================================
+// DISK-BACKED SKETCH STORE
+// ==============================================================
+
+typedef struct {
+  FILE *fp;              /* Write handle (NULL after finalize) */
+  char path[PATH_MAX];   /* Temp file path */
+  size_t file_size;      /* Total bytes written */
+  uint64_t *mmap_base;   /* mmap'd region after finalize */
+  int fd;                /* File descriptor for mmap */
+} SketchStore;
+
+static void skstore_init(SketchStore *ss, const char *prefix) {
+  snprintf(ss->path, sizeof(ss->path), "%s.sketch.tmp", prefix);
+  ss->fp = fopen(ss->path, "w+b");
+  /* Use large write buffer to reduce syscall overhead */
+  setvbuf(ss->fp, NULL, _IOFBF, 8 * 1024 * 1024);
+  ss->file_size = 0;
+  ss->mmap_base = NULL;
+  ss->fd = -1;
+}
+
+/* Write hashes to store, return byte offset where they were written */
+static size_t skstore_write(SketchStore *ss, const uint64_t *hashes,
+                            size_t count) {
+  size_t offset = ss->file_size;
+  fwrite(hashes, sizeof(uint64_t), count, ss->fp);
+  ss->file_size += count * sizeof(uint64_t);
+  return offset;
+}
+
+/* Finalize: close write handle, mmap the file for read access */
+static void skstore_finalize(SketchStore *ss) {
+  if (ss->fp) {
+    fflush(ss->fp);
+    fclose(ss->fp);
+    ss->fp = NULL;
+  }
+  if (ss->file_size > 0) {
+    ss->fd = open(ss->path, O_RDONLY);
+    if (ss->fd >= 0) {
+      ss->mmap_base = mmap(NULL, ss->file_size, PROT_READ, MAP_SHARED,
+                           ss->fd, 0);
+      if (ss->mmap_base == MAP_FAILED) {
+        fprintf(stderr, "[reverb] Warning: mmap failed\n");
+        ss->mmap_base = NULL;
+      } else {
+        madvise(ss->mmap_base, ss->file_size, MADV_RANDOM);
+      }
+    }
+  }
+}
+
+/* Get pointer to hashes for a window (byte_offset, count) */
+static const uint64_t *skstore_get(const SketchStore *ss, size_t byte_offset,
+                                   size_t count) {
+  (void)count;
+  return ss->mmap_base + (byte_offset / sizeof(uint64_t));
+}
+
+static void skstore_destroy(SketchStore *ss) {
+  if (ss->mmap_base && ss->mmap_base != MAP_FAILED)
+    munmap(ss->mmap_base, ss->file_size);
+  if (ss->fd >= 0)
+    close(ss->fd);
+  unlink(ss->path);
+  ss->mmap_base = NULL;
+  ss->fd = -1;
+}
+
+// ==============================================================
 // SKETCH EXTRACTION
 // ==============================================================
 
@@ -240,13 +314,13 @@ ReverbDistResult reverb_dist(const ReverbSketch *ref, const ReverbSketch *query,
 
 void uf_init(UnionFind *uf, size_t n) {
   uf->n = n;
-  uf->parent = (uint64_t *)malloc(n * sizeof(uint64_t));
-  uf->rank = (uint64_t *)calloc(n, sizeof(uint64_t));
+  uf->parent = (uint32_t *)malloc(n * sizeof(uint32_t));
+  uf->rank = (uint32_t *)calloc(n, sizeof(uint32_t));
   for (size_t i = 0; i < n; i++)
-    uf->parent[i] = (uint64_t)i;
+    uf->parent[i] = (uint32_t)i;
 }
 
-uint64_t uf_find(UnionFind *uf, uint64_t x) {
+uint32_t uf_find(UnionFind *uf, uint32_t x) {
   while (uf->parent[x] != x) {
     uf->parent[x] = uf->parent[uf->parent[x]]; /* path splitting */
     x = uf->parent[x];
@@ -254,13 +328,13 @@ uint64_t uf_find(UnionFind *uf, uint64_t x) {
   return x;
 }
 
-void uf_union(UnionFind *uf, uint64_t a, uint64_t b) {
+void uf_union(UnionFind *uf, uint32_t a, uint32_t b) {
   a = uf_find(uf, a);
   b = uf_find(uf, b);
   if (a == b)
     return;
   if (uf->rank[a] < uf->rank[b])
-    SWAP(uint64_t, a, b);
+    SWAP(uint32_t, a, b);
   uf->parent[b] = a;
   if (uf->rank[a] == uf->rank[b])
     uf->rank[a]++;
@@ -301,12 +375,14 @@ typedef struct {
   uint32_t seq_id;
   size_t start;
   size_t end;
+  size_t sketch_offset;  /* byte offset in SketchStore */
+  uint32_t sketch_size;  /* number of hashes */
 } WindowCoord;
 
 /* Inverted hash index entry: maps a hash value to its source window */
 typedef struct {
   uint64_t hash;
-  uint64_t window_id;
+  uint32_t window_id;
 } HashWindowEntry;
 
 // ==============================================================
@@ -321,7 +397,7 @@ static int cmp_hash_window_entry(const void *a, const void *b) {
 }
 
 typedef struct {
-  ReverbSketch *sketches;
+  const SketchStore *store;
   WindowCoord *coords;
   HashWindowEntry *entries;
   size_t total_entries;
@@ -334,16 +410,35 @@ typedef struct {
   size_t *t_cap_edges;
 } EdgeWorkerData;
 
+KHASH_MAP_INIT_INT(u32, uint16_t)
+
+/* Helper: compute distance between two windows using SketchStore */
+static ReverbDistResult skstore_dist(const SketchStore *store,
+                                     const WindowCoord *wa,
+                                     const WindowCoord *wb,
+                                     uint32_t kmer_size) {
+  ReverbSketch sa = {.sketch_size = wa->sketch_size,
+                     .hashes = (uint64_t *)skstore_get(store, wa->sketch_offset,
+                                                       wa->sketch_size)};
+  ReverbSketch sb = {.sketch_size = wb->sketch_size,
+                     .hashes = (uint64_t *)skstore_get(store, wb->sketch_offset,
+                                                       wb->sketch_size)};
+  return reverb_dist(&sa, &sb, kmer_size);
+}
+
 static void edge_worker(void *data, long i, int tid) {
   EdgeWorkerData *w = (EdgeWorkerData *)data;
-  uint64_t a = (uint64_t)i;
+  uint32_t a = (uint32_t)i;
 
-  uint16_t *counts = calloc(w->n_windows, sizeof(uint16_t));
-  uint64_t *touched = malloc(w->n_windows * sizeof(uint64_t));
-  size_t n_touched = 0;
+  const uint64_t *a_hashes =
+      skstore_get(w->store, w->coords[a].sketch_offset,
+                  w->coords[a].sketch_size);
 
-  for (size_t k = 0; k < w->sketches[a].sketch_size; k++) {
-    uint64_t hash = w->sketches[a].hashes[k];
+  khash_t(u32) *counts = kh_init(u32);
+  int ret;
+
+  for (uint32_t k = 0; k < w->coords[a].sketch_size; k++) {
+    uint64_t hash = a_hashes[k];
 
     // Binary search in entries
     size_t left = 0, right = w->total_entries;
@@ -363,70 +458,92 @@ static void edge_worker(void *data, long i, int tid) {
 
       if (run_len >= 2 && run_len <= 100) {
         for (size_t idx = left; idx < run_end; idx++) {
-          uint64_t b = w->entries[idx].window_id;
+          uint32_t b = w->entries[idx].window_id;
           if (b > a) {
-            if (counts[b] == 0)
-              touched[n_touched++] = b;
-            counts[b]++;
+            khint_t ki = kh_put(u32, counts, b, &ret);
+            if (ret) /* new key */
+              kh_val(counts, ki) = 1;
+            else
+              kh_val(counts, ki)++;
           }
         }
       }
     }
   }
 
-  for (size_t t = 0; t < n_touched; t++) {
-    uint64_t b = touched[t];
-    if (counts[b] >= 2) {
+  khint_t ki;
+  for (ki = kh_begin(counts); ki != kh_end(counts); ++ki) {
+    if (!kh_exist(counts, ki))
+      continue;
+    uint32_t b = kh_key(counts, ki);
+    uint16_t cnt = kh_val(counts, ki);
+    if (cnt >= 2) {
       if (w->coords[a].seq_id != w->coords[b].seq_id ||
           ABS_DIFF(w->coords[a].start, w->coords[b].start) >= w->window_size) {
         ReverbDistResult d =
-            reverb_dist(&w->sketches[a], &w->sketches[b], w->kmer_size);
+            skstore_dist(w->store, &w->coords[a], &w->coords[b], w->kmer_size);
         if (d.distance < w->max_dist) {
           DA_PUSH(w->t_edges[tid], w->t_n_edges[tid], w->t_cap_edges[tid],
                   ((ReverbDupEdge){a, b, d.distance}));
         }
       }
     }
-    counts[b] = 0;
   }
 
-  free(counts);
-  free(touched);
+  kh_destroy(u32, counts);
 }
 
 /* Build inverted hash index and find candidate pairs.
+ * Uses SketchStore (mmap-backed) instead of in-memory sketch arrays.
  * Returns edges where distance < max_dist, excluding adjacent windows
  * on the same chromosome. */
-static size_t build_candidate_edges(ReverbSketch *sketches, WindowCoord *coords,
+static size_t build_candidate_edges(const SketchStore *store,
+                                    WindowCoord *coords,
                                     size_t n_windows, double max_dist,
                                     size_t window_size, int n_threads,
                                     uint32_t kmer_size,
-                                    ReverbDupEdge **out_edges) {
+                                    ReverbDupEdge **out_edges,
+                                    const char *out_prefix) {
   /* 1. Flatten all (hash, window_id) entries */
   size_t total_entries = 0;
   for (size_t i = 0; i < n_windows; i++)
-    total_entries += sketches[i].sketch_size;
+    total_entries += coords[i].sketch_size;
 
   if (total_entries == 0) {
     *out_edges = NULL;
     return 0;
   }
 
-  HashWindowEntry *entries = malloc(total_entries * sizeof(HashWindowEntry));
+  /* Use file-backed mmap for entries — OS manages physical memory via paging */
+  size_t entries_bytes = total_entries * sizeof(HashWindowEntry);
+  char entries_path[PATH_MAX];
+  snprintf(entries_path, sizeof(entries_path), "%s.idx.tmp", out_prefix);
+  int entries_fd = open(entries_path, O_RDWR | O_CREAT | O_TRUNC, 0600);
+  ftruncate(entries_fd, entries_bytes);
+  HashWindowEntry *entries = mmap(NULL, entries_bytes, PROT_READ | PROT_WRITE,
+                                  MAP_SHARED, entries_fd, 0);
+
+  fprintf(stderr, "[reverb] Building inverted index: %.1f MB (%zu entries)\n",
+          entries_bytes / (1024.0 * 1024.0), total_entries);
+
   size_t idx = 0;
   for (size_t i = 0; i < n_windows; i++) {
-    for (size_t j = 0; j < sketches[i].sketch_size; j++) {
-      entries[idx++] = (HashWindowEntry){.hash = sketches[i].hashes[j],
-                                         .window_id = (uint64_t)i};
+    const uint64_t *hashes =
+        skstore_get(store, coords[i].sketch_offset, coords[i].sketch_size);
+    for (uint32_t j = 0; j < coords[i].sketch_size; j++) {
+      entries[idx++] = (HashWindowEntry){.hash = hashes[j],
+                                         .window_id = (uint32_t)i};
     }
   }
 
   /* 2. Sort by hash value */
   qsort(entries, total_entries, sizeof(HashWindowEntry), cmp_hash_window_entry);
+  /* After sort, advise random access for binary searches */
+  madvise(entries, entries_bytes, MADV_RANDOM);
 
   /* 3. Parallel distance computation using query-driven search */
   EdgeWorkerData w;
-  w.sketches = sketches;
+  w.store = store;
   w.coords = coords;
   w.entries = entries;
   w.total_entries = total_entries;
@@ -439,7 +556,9 @@ static size_t build_candidate_edges(ReverbSketch *sketches, WindowCoord *coords,
   w.t_cap_edges = calloc(n_threads, sizeof(size_t));
 
   kt_for(n_threads, edge_worker, &w, n_windows);
-  free(entries);
+  munmap(entries, entries_bytes);
+  close(entries_fd);
+  unlink(entries_path);
 
   size_t n_edges = 0;
   for (int t = 0; t < n_threads; t++)
@@ -589,7 +708,7 @@ typedef struct {
 static int dup_stream_pangenome(const char *filename, const char *bname,
                                 const Reverb *r, uint64_t scale,
                                 size_t window_size, size_t step_size,
-                                size_t min_bases, ReverbSketch **sketches,
+                                size_t min_bases, SketchStore *store,
                                 WindowCoord **coords, size_t *num_sketches,
                                 size_t *cap_sketches, FILE *bed_fp,
                                 GenomeSeqLen **seq_lens, size_t *num_seqs,
@@ -628,13 +747,10 @@ static int dup_stream_pangenome(const char *filename, const char *bname,
 
       if (*num_sketches >= *cap_sketches) {
         *cap_sketches = *cap_sketches == 0 ? 256 : *cap_sketches * 2;
-        *sketches = realloc(*sketches, *cap_sketches * sizeof(ReverbSketch));
         *coords = realloc(*coords, *cap_sketches * sizeof(WindowCoord));
       }
 
-      ReverbSketch *sk = &(*sketches)[*num_sketches];
       WindowCoord *wc = &(*coords)[*num_sketches];
-      memset(sk, 0, sizeof(ReverbSketch));
 
       wc->seq_id = (uint32_t)(*num_seqs - 1);
       wc->start = i;
@@ -644,13 +760,23 @@ static int dup_stream_pangenome(const char *filename, const char *bname,
         fprintf(bed_fp, "%s\t%zu\t%zu\t%s_%zu_%zu\n", chr_name, i,
                 i + window_size, chr_name, i, i + window_size);
 
+      /* Extract sketch, write to disk, free immediately */
       HashPool pool;
       pool_init(&pool, UINT64_MAX / scale);
       extract_and_insert(r, &pool, (const uint8_t *)ks->seq.s + i, window_size);
-      pool_finalize(&pool, &sk->hashes, &sk->sketch_size);
 
-      if (sk->sketch_size > 0) {
+      uint64_t *hashes = NULL;
+      size_t sketch_size = 0;
+      pool_finalize(&pool, &hashes, &sketch_size);
+
+      if (sketch_size > 0) {
+        wc->sketch_offset = skstore_write(store, hashes, sketch_size);
+        wc->sketch_size = (uint32_t)sketch_size;
+        free(hashes);
         (*num_sketches)++;
+      } else {
+        if (hashes)
+          free(hashes);
       }
     }
   }
@@ -1308,7 +1434,8 @@ int cmd_pangenome(int argc, char **argv, const char *pangenome_dir,
     }
   }
 
-  ReverbSketch *sketches = NULL;
+  SketchStore sketch_store;
+  skstore_init(&sketch_store, out_prefix);
   WindowCoord *coords = NULL;
   size_t num_sketches = 0, cap_sketches = 0;
   ReverbDupEdge *edges = NULL;
@@ -1325,15 +1452,21 @@ int cmd_pangenome(int argc, char **argv, const char *pangenome_dir,
     char bname[256];
     get_basename(files[i], bname, sizeof(bname));
     dup_stream_pangenome(files[i], bname, r, scale, window_size, step_size,
-                         min_bases, &sketches, &coords, &num_sketches,
+                         min_bases, &sketch_store, &coords, &num_sketches,
                          &cap_sketches, bed_fp, &seq_lens, &num_seqs,
                          &cap_seqs);
   }
   fclose(bed_fp);
 
+  /* Finalize: mmap the sketch file for random access */
+  skstore_finalize(&sketch_store);
+  fprintf(stderr, "[reverb] Sketches stored on disk: %.1f MB (%zu windows)\n",
+          sketch_store.file_size / (1024.0 * 1024.0), num_sketches);
+
   size_t n_edges =
-      build_candidate_edges(sketches, coords, num_sketches, max_dist,
-                            window_size, n_threads, r->hash_window, &edges);
+      build_candidate_edges(&sketch_store, coords, num_sketches, max_dist,
+                            window_size, n_threads, r->hash_window, &edges,
+                            out_prefix);
 
   uint32_t *genome_id = calloc(num_sketches, sizeof(uint32_t));
   for (size_t i = 0; i < num_sketches; i++) {
@@ -1359,12 +1492,12 @@ int cmd_pangenome(int argc, char **argv, const char *pangenome_dir,
 
   uint32_t *comp_size_intra = calloc(num_sketches, sizeof(uint32_t));
   for (size_t i = 0; i < num_sketches; i++) {
-    comp_size_intra[uf_find(&uf_intra, (uint64_t)i)]++;
+    comp_size_intra[uf_find(&uf_intra, (uint32_t)i)]++;
   }
 
   uint8_t *is_sd = calloc(num_sketches, sizeof(uint8_t));
   for (size_t i = 0; i < num_sketches; i++) {
-    uint64_t fam = uf_find(&uf_intra, (uint64_t)i);
+    uint32_t fam = uf_find(&uf_intra, (uint32_t)i);
     if (comp_size_intra[fam] >= (uint32_t)min_copy &&
         (max_copy <= 0 || comp_size_intra[fam] <= (uint32_t)max_copy)) {
       is_sd[i] = 1;
@@ -1377,8 +1510,8 @@ int cmd_pangenome(int argc, char **argv, const char *pangenome_dir,
   UnionFind uf;
   uf_init(&uf, num_sketches);
   for (size_t i = 0; i < n_edges; i++) {
-    uint64_t a = edges[i].win_a;
-    uint64_t b = edges[i].win_b;
+    uint32_t a = edges[i].win_a;
+    uint32_t b = edges[i].win_b;
     if (genome_id[a] == genome_id[b]) {
       uf_union(&uf, a, b);
     } else if (is_sd[a] || is_sd[b]) {
@@ -1389,18 +1522,18 @@ int cmd_pangenome(int argc, char **argv, const char *pangenome_dir,
   uint8_t *final_is_sd = calloc(num_sketches, sizeof(uint8_t));
   for (size_t i = 0; i < num_sketches; i++) {
     if (is_sd[i])
-      final_is_sd[uf_find(&uf, (uint64_t)i)] = 1;
+      final_is_sd[uf_find(&uf, (uint32_t)i)] = 1;
   }
   free(is_sd);
 
   uint32_t *comp_size = calloc(num_sketches, sizeof(uint32_t));
   for (size_t i = 0; i < num_sketches; i++)
-    comp_size[uf_find(&uf, (uint64_t)i)]++;
+    comp_size[uf_find(&uf, (uint32_t)i)]++;
 
   char **hub_label = calloc(num_sketches, sizeof(char *));
   for (size_t i = 0; i < num_sketches; i++) {
     if (genome_id[i] == 0) {
-      uint64_t fam = uf_find(&uf, (uint64_t)i);
+      uint32_t fam = uf_find(&uf, (uint32_t)i);
       if (!hub_label[fam]) {
         char buf[512];
         snprintf(buf, sizeof(buf), "%s-%s@%zu-%zu",
@@ -1416,7 +1549,7 @@ int cmd_pangenome(int argc, char **argv, const char *pangenome_dir,
   size_t n_dup_regions = 0, cap_dup_regions = 0;
   ReverbDupRegion *dup_regions = NULL;
   for (size_t i = 0; i < num_sketches; i++) {
-    uint64_t fam = uf_find(&uf, (uint64_t)i);
+    uint32_t fam = uf_find(&uf, (uint32_t)i);
     if (!final_is_sd[fam])
       continue;
 
@@ -1447,9 +1580,9 @@ int cmd_pangenome(int argc, char **argv, const char *pangenome_dir,
       out_bedpe,
       "#chrom1\tstart1\tend1\tchrom2\tstart2\tend2\tcluster_id\tdistance\n");
   for (size_t i = 0; i < n_edges; i++) {
-    uint64_t a = edges[i].win_a;
-    uint64_t b = edges[i].win_b;
-    uint64_t fam = uf_find(&uf, a);
+    uint32_t a = edges[i].win_a;
+    uint32_t b = edges[i].win_b;
+    uint32_t fam = uf_find(&uf, a);
     if (!hub_label[fam])
       continue;
 
@@ -1482,6 +1615,7 @@ int cmd_pangenome(int argc, char **argv, const char *pangenome_dir,
     }
     free(hub_label);
 
+    skstore_destroy(&sketch_store);
     return 0;
   }
 
@@ -1649,6 +1783,7 @@ int cmd_pangenome(int argc, char **argv, const char *pangenome_dir,
   }
   free(hub_label);
 
+  skstore_destroy(&sketch_store);
   return 0;
 }
 
