@@ -547,84 +547,98 @@ typedef struct {
   char *seq;
 } GenomeSeqLen;
 
-static int stream_pangenome(const char *filename, const char *bname,
-                            const Reverb *r, uint64_t scale, size_t window_size,
-                            size_t step_size, size_t min_bases,
-                            uint64_t **all_hashes, size_t *num_all_hashes,
-                            size_t *cap_all_hashes, WindowCoord **coords,
-                            size_t *num_sketches, size_t *cap_sketches,
-                            FILE *bed_fp, GenomeSeqLen **seq_lens,
-                            size_t *num_seqs, size_t *cap_seqs) {
-  gzFile fp = gzopen(filename, "r");
+typedef struct {
+  const char *filename;
+  char bname[256];
+  const Reverb *r;
+  uint64_t scale;
+  size_t window_size;
+  size_t step_size;
+  size_t min_bases;
+
+  uint64_t *all_hashes;
+  size_t num_all_hashes;
+  size_t cap_all_hashes;
+
+  WindowCoord *coords;
+  size_t num_sketches;
+  size_t cap_sketches;
+
+  GenomeSeqLen *seq_lens;
+  size_t num_seqs;
+  size_t cap_seqs;
+} StreamWorkerData;
+
+static void stream_pangenome_worker(void *data, long i, int tid) {
+  (void)tid;
+  StreamWorkerData *w = &((StreamWorkerData *)data)[i];
+
+  gzFile fp = gzopen(w->filename, "r");
   if (!fp)
-    return -1;
+    return;
   kseq_t *ks = kseq_init(fp);
   if (!ks) {
     gzclose(fp);
-    return -1;
+    return;
   }
 
   while (kseq_read(ks) >= 0) {
-    char chr_name[512];
-    snprintf(chr_name, sizeof(chr_name), "%s-%s", bname, ks->name.s);
     size_t len = ks->seq.l;
 
-    if (*num_seqs >= *cap_seqs) {
-      *cap_seqs = *cap_seqs == 0 ? 16 : *cap_seqs * 2;
-      *seq_lens = realloc(*seq_lens, *cap_seqs * sizeof(GenomeSeqLen));
+    if (w->num_seqs >= w->cap_seqs) {
+      w->cap_seqs = w->cap_seqs == 0 ? 16 : w->cap_seqs * 2;
+      w->seq_lens = realloc(w->seq_lens, w->cap_seqs * sizeof(GenomeSeqLen));
     }
-    (*seq_lens)[*num_seqs].genome = strdup(bname);
-    (*seq_lens)[*num_seqs].seq = strdup(ks->name.s);
-    (*num_seqs)++;
+    w->seq_lens[w->num_seqs].genome = strdup(w->bname);
+    w->seq_lens[w->num_seqs].seq = strdup(ks->name.s);
+    w->num_seqs++;
 
-    for (size_t i = 0; i + window_size <= len; i += step_size) {
+    for (size_t idx = 0; idx + w->window_size <= len; idx += w->step_size) {
       size_t valid_bases = 0;
-      for (size_t j = 0; j < window_size; j++) {
-        if (BASE_LOOKUP[(uint8_t)ks->seq.s[i + j]] >= 0)
+      for (size_t j = 0; j < w->window_size; j++) {
+        if (BASE_LOOKUP[(uint8_t)ks->seq.s[idx + j]] >= 0)
           valid_bases++;
       }
-      if (valid_bases < min_bases)
+      if (valid_bases < w->min_bases)
         continue;
 
-      if (*num_sketches >= *cap_sketches) {
-        *cap_sketches = *cap_sketches == 0 ? 256 : *cap_sketches * 2;
-        *coords = realloc(*coords, *cap_sketches * sizeof(WindowCoord));
+      if (w->num_sketches >= w->cap_sketches) {
+        w->cap_sketches = w->cap_sketches == 0 ? 256 : w->cap_sketches * 2;
+        w->coords = realloc(w->coords, w->cap_sketches * sizeof(WindowCoord));
       }
 
-      WindowCoord *wc = &(*coords)[*num_sketches];
+      WindowCoord *wc = &w->coords[w->num_sketches];
 
-      wc->seq_id = (uint32_t)(*num_seqs - 1);
-      wc->start = i;
-      wc->end = i + window_size;
-
-      if (bed_fp)
-        fprintf(bed_fp, "%s\t%zu\t%zu\t%s_%zu_%zu\n", chr_name, i,
-                i + window_size, chr_name, i, i + window_size);
+      wc->seq_id = (uint32_t)(w->num_seqs - 1);
+      wc->start = idx;
+      wc->end = idx + w->window_size;
 
       /* Extract sketch, write to disk, free immediately */
       HashPool pool;
-      init_hash_pool(&pool, UINT64_MAX / scale);
-      extract_hash(r, &pool, (const uint8_t *)ks->seq.s + i, window_size);
+      init_hash_pool(&pool, UINT64_MAX / w->scale);
+      extract_hash(w->r, &pool, (const uint8_t *)ks->seq.s + idx,
+                   w->window_size);
 
       uint64_t *hashes = NULL;
       size_t sketch_size = 0;
       finalize_hash_pool(&pool, &hashes, &sketch_size);
 
       if (sketch_size > 0) {
-        size_t hash_idx = *num_all_hashes;
-        while (*num_all_hashes + sketch_size > *cap_all_hashes) {
-          *cap_all_hashes =
-              (*cap_all_hashes == 0) ? 1048576 : (*cap_all_hashes * 2);
-          *all_hashes =
-              realloc(*all_hashes, (*cap_all_hashes) * sizeof(uint64_t));
+        size_t hash_idx = w->num_all_hashes;
+        while (w->num_all_hashes + sketch_size > w->cap_all_hashes) {
+          w->cap_all_hashes =
+              (w->cap_all_hashes == 0) ? 1048576 : (w->cap_all_hashes * 2);
+          w->all_hashes =
+              realloc(w->all_hashes, (w->cap_all_hashes) * sizeof(uint64_t));
         }
-        memcpy(*all_hashes + hash_idx, hashes, sketch_size * sizeof(uint64_t));
-        *num_all_hashes += sketch_size;
+        memcpy(w->all_hashes + hash_idx, hashes,
+               sketch_size * sizeof(uint64_t));
+        w->num_all_hashes += sketch_size;
 
         wc->sketch_offset = hash_idx;
         wc->sketch_size = (uint32_t)sketch_size;
         free(hashes);
-        (*num_sketches)++;
+        w->num_sketches++;
       } else {
         if (hashes)
           free(hashes);
@@ -633,9 +647,7 @@ static int stream_pangenome(const char *filename, const char *bname,
   }
   kseq_destroy(ks);
   gzclose(fp);
-  return 0;
 }
-
 static void extract_flankings(char **files, int num_files, const Reverb *r,
                               uint64_t scale, ReverbDupRegion *regions,
                               size_t n_regions, size_t flank_size) {
@@ -774,10 +786,10 @@ int run_pangenome(int num_files, char **files, size_t flank_size,
                   int n_threads) {
 
   uint64_t *all_hashes = NULL;
-  size_t num_all_hashes = 0, cap_all_hashes = 0;
+  size_t num_all_hashes = 0;
 
   WindowCoord *coords = NULL;
-  size_t num_sketches = 0, cap_sketches = 0;
+  size_t num_sketches = 0;
   ReverbDupEdge *edges = NULL;
 
   char path_buf[PATH_MAX];
@@ -786,16 +798,78 @@ int run_pangenome(int num_files, char **files, size_t flank_size,
 
   fprintf(stderr, "[reverb] Extracting windows across pangenome...\\n");
   GenomeSeqLen *seq_lens = NULL;
-  size_t num_seqs = 0, cap_seqs = 0;
+
+  StreamWorkerData *workers = calloc(num_files, sizeof(StreamWorkerData));
+  for (int i = 0; i < num_files; i++) {
+    workers[i].filename = files[i];
+    get_basename(files[i], workers[i].bname, sizeof(workers[i].bname));
+    workers[i].r = r;
+    workers[i].scale = scale;
+    workers[i].window_size = window_size;
+    workers[i].step_size = step_size;
+    workers[i].min_bases = min_bases;
+  }
+
+  kt_for(n_threads, stream_pangenome_worker, workers, num_files);
+
+  size_t total_hashes = 0, total_sketches = 0, total_seqs = 0;
+  for (int i = 0; i < num_files; i++) {
+    total_hashes += workers[i].num_all_hashes;
+    total_sketches += workers[i].num_sketches;
+    total_seqs += workers[i].num_seqs;
+  }
+
+  all_hashes = malloc(total_hashes * sizeof(uint64_t));
+  coords = malloc(total_sketches * sizeof(WindowCoord));
+  seq_lens = malloc(total_seqs * sizeof(GenomeSeqLen));
+
+  size_t g_hash_offset = 0;
+  size_t g_sketch_offset = 0;
+  size_t g_seq_offset = 0;
 
   for (int i = 0; i < num_files; i++) {
-    char bname[256];
-    get_basename(files[i], bname, sizeof(bname));
-    stream_pangenome(files[i], bname, r, scale, window_size, step_size,
-                     min_bases, &all_hashes, &num_all_hashes, &cap_all_hashes,
-                     &coords, &num_sketches, &cap_sketches, bed_fp, &seq_lens,
-                     &num_seqs, &cap_seqs);
+    StreamWorkerData *w = &workers[i];
+
+    // Copy all_hashes
+    if (w->num_all_hashes > 0) {
+      memcpy(all_hashes + g_hash_offset, w->all_hashes,
+             w->num_all_hashes * sizeof(uint64_t));
+    }
+
+    // Copy seq_lens
+    if (w->num_seqs > 0) {
+      memcpy(seq_lens + g_seq_offset, w->seq_lens,
+             w->num_seqs * sizeof(GenomeSeqLen));
+    }
+
+    // Copy coords and write to bed
+    for (size_t j = 0; j < w->num_sketches; j++) {
+      WindowCoord c = w->coords[j];
+      c.sketch_offset += g_hash_offset;
+      c.seq_id += g_seq_offset;
+      coords[g_sketch_offset + j] = c;
+
+      if (bed_fp) {
+        char chr_name[512];
+        snprintf(chr_name, sizeof(chr_name), "%s-%s", seq_lens[c.seq_id].genome,
+                 seq_lens[c.seq_id].seq);
+        fprintf(bed_fp, "%s\t%zu\t%zu\t%s_%zu_%zu\n", chr_name, c.start, c.end,
+                chr_name, c.start, c.end);
+      }
+    }
+
+    g_hash_offset += w->num_all_hashes;
+    g_sketch_offset += w->num_sketches;
+    g_seq_offset += w->num_seqs;
+
+    free(w->all_hashes);
+    free(w->coords);
+    free(w->seq_lens);
   }
+  free(workers);
+
+  num_all_hashes = total_hashes;
+  num_sketches = total_sketches;
   fclose(bed_fp);
 
   fprintf(
