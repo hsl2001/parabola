@@ -31,10 +31,10 @@ awk -v pref="$REF_PREFIX" 'BEGIN{OFS="\t"} $1 ~ "^"pref {
 # A has 6 columns. B (GFF) has 9 columns.
 bedtools intersect -a "$TMP_DIR/ref.bed" -b "$GFF_FILE" -wa -wb > "$TMP_DIR/intersected.txt"
 
-# 3. Create a mapping from cluster_id to TE annotation
+# 3. Create a mapping from cluster_id and subcluster_id to TE annotation
 # We use awk to extract Name, family_name, and classification from the 15th column (GFF attributes)
 awk -F'\t' 'BEGIN { OFS="\t" } {
-    cluster_id = $4
+    key = $4 "_" $5
     attr = $15
     
     name = "NA"; family = "NA"; class = "NA"
@@ -46,9 +46,9 @@ awk -F'\t' 'BEGIN { OFS="\t" } {
         else if (a[i] ~ /^classification=/) { class = substr(a[i], 16) }
     }
     
-    # If a cluster overlaps multiple TEs, we just keep the first one we see
-    if (!(cluster_id in map)) {
-        map[cluster_id] = name "\t" family "\t" class
+    # If a cluster/subcluster overlaps multiple TEs, we just keep the first one we see
+    if (!(key in map)) {
+        map[key] = name "\t" family "\t" class
     }
 }
 END {
@@ -68,8 +68,8 @@ NR==FNR {
 }
 /^#/ { next }
 {
-    cluster_id = $4
-    annot = map[cluster_id]
+    key = $4 "_" $5
+    annot = map[key]
     if (annot == "") {
         annot = "NA\tNA\tNA"
     }
