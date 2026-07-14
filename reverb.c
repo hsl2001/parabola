@@ -433,9 +433,6 @@ static size_t build_candidate_edges(const uint64_t *all_hashes,
   size_t entries_bytes = total_entries * sizeof(HashWindowEntry);
   HashWindowEntry *entries = malloc(entries_bytes);
 
-  fprintf(stderr, "[INFO] Built inverted hash index: %.1f MB (%zu entries)\n",
-          entries_bytes / (1024.0 * 1024.0), total_entries);
-
   size_t idx = 0;
   for (size_t i = 0; i < n_windows; i++) {
     const uint64_t *hashes = all_hashes + coords[i].sketch_offset;
@@ -871,10 +868,6 @@ int run_pangenome(int num_files, char **files, size_t flank_size,
   num_all_hashes = total_hashes;
   num_sketches = total_sketches;
   fclose(bed_fp);
-
-  fprintf(
-      stderr, "[reverb] Sketches stored in memory: %.1f MB (%zu windows)\\n",
-      (num_all_hashes * sizeof(uint64_t)) / (1024.0 * 1024.0), num_sketches);
 
   size_t n_edges =
       build_candidate_edges(all_hashes, coords, num_sketches, max_dist,
