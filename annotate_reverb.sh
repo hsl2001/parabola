@@ -34,7 +34,7 @@ bedtools intersect -a "$TMP_DIR/ref.bed" -b "$GFF_FILE" -wa -wb > "$TMP_DIR/inte
 
 # 3. Create a mapping from cluster_id to TE annotation
 # We use awk to extract Name, family_name, and classification from the 15th column (GFF attributes)
-awk -F'\t' 'BEGIN { OFS="\t" } {
+awk -F'\t' 'BEGIN { OFS="\t" } $9 == "mobile_element" {
     cluster_id = $4
     attr = $15
     
