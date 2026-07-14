@@ -1299,71 +1299,48 @@ int cmd_pangenome(int num_files, char **files, size_t flank_size,
     }
   }
 
-  // Step 1: Intra-genome UnionFind for Representative Genome (genome_id == 0)
-  // ONLY
-  UnionFind uf_intra;
-  uf_init(&uf_intra, num_sketches);
-  for (size_t i = 0; i < n_edges; i++) {
-    if (genome_id[edges[i].win_a] == 0 && genome_id[edges[i].win_b] == 0) {
-      uf_union(&uf_intra, edges[i].win_a, edges[i].win_b);
-    }
-  }
-
-  uint32_t *comp_size_intra = calloc(num_sketches, sizeof(uint32_t));
-  for (size_t i = 0; i < num_sketches; i++) {
-    comp_size_intra[uf_find(&uf_intra, (uint32_t)i)]++;
-  }
-
-  uint8_t *is_sd = calloc(num_sketches, sizeof(uint8_t));
-  for (size_t i = 0; i < num_sketches; i++) {
-    uint32_t fam = uf_find(&uf_intra, (uint32_t)i);
-    if (comp_size_intra[fam] >= (uint32_t)min_copy &&
-        (max_copy <= 0 || comp_size_intra[fam] <= (uint32_t)max_copy)) {
-      is_sd[i] = 1;
-    }
-  }
-  free(comp_size_intra);
-  uf_free(&uf_intra);
-
-  // Step 2: Final UnionFind
+  // Single Global UnionFind
   UnionFind uf;
   uf_init(&uf, num_sketches);
   for (size_t i = 0; i < n_edges; i++) {
-    uint32_t a = edges[i].win_a;
-    uint32_t b = edges[i].win_b;
-    if (genome_id[a] == genome_id[b]) {
-      uf_union(&uf, a, b);
-    } else if (is_sd[a] || is_sd[b]) {
-      uf_union(&uf, a, b);
+    uf_union(&uf, edges[i].win_a, edges[i].win_b);
+  }
+
+  // Count instances per genome per family
+  uint32_t *max_intra_copy = calloc(num_sketches, sizeof(uint32_t));
+  uint32_t *counts = calloc(num_sketches * num_files, sizeof(uint32_t));
+  for (size_t i = 0; i < num_sketches; i++) {
+    uint32_t fam = uf_find(&uf, (uint32_t)i);
+    uint32_t g_id = genome_id[i];
+    counts[fam * num_files + g_id]++;
+    if (counts[fam * num_files + g_id] > max_intra_copy[fam]) {
+      max_intra_copy[fam] = counts[fam * num_files + g_id];
     }
   }
+  free(counts);
 
   uint8_t *final_is_sd = calloc(num_sketches, sizeof(uint8_t));
-  for (size_t i = 0; i < num_sketches; i++) {
-    if (is_sd[i])
-      final_is_sd[uf_find(&uf, (uint32_t)i)] = 1;
-  }
-  free(is_sd);
-
-  uint32_t *comp_size = calloc(num_sketches, sizeof(uint32_t));
-  for (size_t i = 0; i < num_sketches; i++)
-    comp_size[uf_find(&uf, (uint32_t)i)]++;
-
   char **hub_label = calloc(num_sketches, sizeof(char *));
+  uint32_t next_cluster_id = 1;
+  
   for (size_t i = 0; i < num_sketches; i++) {
-    if (genome_id[i] == 0) {
-      uint32_t fam = uf_find(&uf, (uint32_t)i);
+    uint32_t fam = uf_find(&uf, (uint32_t)i);
+    if (max_intra_copy[fam] >= (uint32_t)min_copy &&
+        (max_copy <= 0 || max_intra_copy[fam] <= (uint32_t)max_copy)) {
+      final_is_sd[fam] = 1;
       if (!hub_label[fam]) {
-        char buf[512];
-        snprintf(buf, sizeof(buf), "%s-%s@%zu-%zu",
-                 seq_lens[coords[i].seq_id].genome,
-                 seq_lens[coords[i].seq_id].seq, coords[i].start,
-                 coords[i].end);
+        char buf[64];
+        snprintf(buf, sizeof(buf), "%u", next_cluster_id++);
         hub_label[fam] = strdup(buf);
       }
     }
   }
   free(genome_id);
+  free(max_intra_copy);
+
+  uint32_t *comp_size = calloc(num_sketches, sizeof(uint32_t));
+  for (size_t i = 0; i < num_sketches; i++)
+    comp_size[uf_find(&uf, (uint32_t)i)]++;
 
   size_t n_dup_regions = 0, cap_dup_regions = 0;
   ReverbDupRegion *dup_regions = NULL;
