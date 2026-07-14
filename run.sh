@@ -1,0 +1,1 @@
+echo "cd `pwd`; ./time ./parabola/reverb -p 128 -o AT-70 upload_genome/*.fasta" | qsub -N reverb -l nodes=node02:ppn=128 -v WORKDIR=`pwd` -j oe -o ~/log/reverb.log
