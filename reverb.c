@@ -783,7 +783,6 @@ int run_pangenome(int num_files, char **files, size_t flank_size,
                   int n_threads) {
 
   uint64_t *all_hashes = NULL;
-  size_t num_all_hashes = 0;
 
   WindowCoord *coords = NULL;
   size_t num_sketches = 0;
@@ -865,7 +864,6 @@ int run_pangenome(int num_files, char **files, size_t flank_size,
   }
   free(workers);
 
-  num_all_hashes = total_hashes;
   num_sketches = total_sketches;
   fclose(bed_fp);
 
