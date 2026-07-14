@@ -44,9 +44,9 @@ awk -F'\t' 'BEGIN { OFS="\t" } {
     for (i=1; i<=n; i++) {
         sub(/^ +/, "", a[i])
         lower_a = tolower(a[i])
-        if (lower_a ~ /^name=/) { name = substr(a[i], 6) }
-        else if (lower_a ~ /^family_name=/) { family = substr(a[i], 13) }
-        else if (lower_a ~ /^classification=/) { class = substr(a[i], 16) }
+        if (lower_a ~ /^name=/) { name = substr(a[i], index(a[i], "=")+1) }
+        else if (lower_a ~ /^family_name=/ || lower_a ~ /^locus_biotype=/) { family = substr(a[i], index(a[i], "=")+1) }
+        else if (lower_a ~ /^classification=/ || lower_a ~ /^class=/) { class = substr(a[i], index(a[i], "=")+1) }
     }
     
     # If a cluster overlaps multiple TEs, we keep the first valid one we see
