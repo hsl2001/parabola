@@ -52,21 +52,19 @@ typedef struct {
   size_t end;
   char *cluster_id;
   uint32_t copy_count;
-  double avg_distance;
   uint32_t subcluster_id;
   ReverbSketch flank_sketch;
 } ReverbDupRegion;
 
-void reverb_init(Reverb *r, size_t hash_window);
-void reverb_sketch_free(ReverbSketch *sk);
-ReverbDistResult reverb_dist(const ReverbSketch *ref,
+void init_reverb(Reverb *r, size_t hash_window);
+ReverbDistResult calculate_reverb_dist(const ReverbSketch *ref,
                              const ReverbSketch *query, uint32_t kmer_size);
 
 /* Union-Find operations */
-void uf_init(UnionFind *uf, size_t n);
-uint32_t uf_find(UnionFind *uf, uint32_t x);
-void uf_union(UnionFind *uf, uint32_t a, uint32_t b);
-void uf_free(UnionFind *uf);
+void init_unionfind(UnionFind *uf, size_t n);
+uint32_t find_unionfind(UnionFind *uf, uint32_t x);
+void union_unionfind(UnionFind *uf, uint32_t a, uint32_t b);
+void free_unionfind(UnionFind *uf);
 
 #ifdef __cplusplus
 }

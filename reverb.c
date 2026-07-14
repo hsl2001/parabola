@@ -1,9 +1,5 @@
-#include <fcntl.h>
 #include <math.h>
 #include <stdio.h>
-#include <sys/mman.h>
-#include <time.h>
-#include <unistd.h>
 #include <zlib.h>
 
 #include "klib/ketopt.h"
@@ -91,7 +87,7 @@ static __uint128_t reverse_bits128(__uint128_t n) {
 // INIT
 // ==============================================================
 
-void reverb_init(Reverb *r, size_t hash_window) {
+void init_reverb(Reverb *r, size_t hash_window) {
   size_t k = hash_window < 42 ? hash_window : 42; /* 3*42=126 bits ≤ 128 */
   uint32_t kmer_bits = 3 * (uint32_t)k;
 
@@ -118,25 +114,25 @@ typedef struct {
 } HashPool;
 
 /* Wrapper for macro to use in `qsort`*/
-static int cmp_uint64(const void *a, const void *b) {
+static int compare_uint64(const void *a, const void *b) {
   return CMP(*(const uint64_t *)a, *(const uint64_t *)b);
 }
 
-static void pool_init(HashPool *pool, uint64_t threshold) {
+static void init_hash_pool(HashPool *pool, uint64_t threshold) {
   *pool = (HashPool){.hash_threshold = threshold};
 }
 
-static void pool_try_insert(HashPool *pool, uint64_t h) {
+static void insert_hash_pool(HashPool *pool, uint64_t h) {
   if (h >= pool->hash_threshold)
     return;
   DA_PUSH(pool->hashes, pool->size, pool->cap, h);
 }
 
-static void pool_finalize(HashPool *pool, uint64_t **out_hashes,
-                          size_t *out_size) {
+static void finalize_hash_pool(HashPool *pool, uint64_t **out_hashes,
+                               size_t *out_size) {
   size_t n = pool->size;
   if (n) {
-    qsort(pool->hashes, n, sizeof(uint64_t), cmp_uint64);
+    qsort(pool->hashes, n, sizeof(uint64_t), compare_uint64);
     /* Deduplicate in-place */
     size_t u = 0;
     for (size_t i = 0; i < n; i++) {
@@ -155,74 +151,6 @@ static void pool_finalize(HashPool *pool, uint64_t **out_hashes,
 }
 
 // ==============================================================
-// DISK-BACKED SKETCH STORE
-// ==============================================================
-
-typedef struct {
-  FILE *fp;            /* Write handle (NULL after finalize) */
-  char path[PATH_MAX]; /* Temp file path */
-  size_t file_size;    /* Total bytes written */
-  uint64_t *mmap_base; /* mmap'd region after finalize */
-  int fd;              /* File descriptor for mmap */
-} SketchStore;
-
-static void skstore_init(SketchStore *ss, const char *prefix) {
-  snprintf(ss->path, sizeof(ss->path), "%s.sketch.tmp", prefix);
-  ss->fp = fopen(ss->path, "w+b");
-  /* Use large write buffer to reduce syscall overhead */
-  setvbuf(ss->fp, NULL, _IOFBF, 8 * 1024 * 1024);
-  ss->file_size = 0;
-  ss->mmap_base = NULL;
-  ss->fd = -1;
-}
-
-/* Write hashes to store, return byte offset where they were written */
-static size_t skstore_write(SketchStore *ss, const uint64_t *hashes,
-                            size_t count) {
-  size_t offset = ss->file_size;
-  fwrite(hashes, sizeof(uint64_t), count, ss->fp);
-  ss->file_size += count * sizeof(uint64_t);
-  return offset;
-}
-
-/* Finalize: close write handle, mmap the file for read access */
-static void skstore_finalize(SketchStore *ss) {
-  if (ss->fp) {
-    fflush(ss->fp);
-    fclose(ss->fp);
-    ss->fp = NULL;
-  }
-  if (ss->file_size > 0) {
-    ss->fd = open(ss->path, O_RDONLY);
-    if (ss->fd >= 0) {
-      ss->mmap_base =
-          mmap(NULL, ss->file_size, PROT_READ, MAP_SHARED, ss->fd, 0);
-      if (ss->mmap_base == MAP_FAILED) {
-        fprintf(stderr, "[reverb] Warning: mmap failed\n");
-        ss->mmap_base = NULL;
-      } else {
-        madvise(ss->mmap_base, ss->file_size, MADV_RANDOM);
-      }
-    }
-  }
-}
-
-/* Get pointer to hashes for a window (byte_offset, count) */
-static const uint64_t *skstore_get(const SketchStore *ss, size_t byte_offset,
-                                   size_t count) {
-  (void)count;
-  return ss->mmap_base + (byte_offset / sizeof(uint64_t));
-}
-
-static void skstore_destroy(SketchStore *ss) {
-  if (ss->mmap_base && ss->mmap_base != MAP_FAILED)
-    munmap(ss->mmap_base, ss->file_size);
-  if (ss->fd >= 0)
-    close(ss->fd);
-  unlink(ss->path);
-  ss->mmap_base = NULL;
-  ss->fd = -1;
-}
 
 // ==============================================================
 // SKETCH EXTRACTION
@@ -230,10 +158,8 @@ static void skstore_destroy(SketchStore *ss) {
 
 /* Extract reverb hash and insert in HashPool */
 /* Hot spot code */
-__attribute__((hot)) static void extract_and_insert(const Reverb *r,
-                                                    HashPool *pool,
-                                                    const uint8_t *seq,
-                                                    size_t len) {
+__attribute__((hot)) static void extract_hash(const Reverb *r, HashPool *pool,
+                                              const uint8_t *seq, size_t len) {
   size_t K = r->hash_window;
   __uint128_t fwd = 0;
   size_t valid = 0;
@@ -263,13 +189,7 @@ __attribute__((hot)) static void extract_and_insert(const Reverb *r,
 
     /* FracMinHash */
     if (h < pool->hash_threshold)
-      pool_try_insert(pool, h);
-  }
-}
-
-void reverb_sketch_free(ReverbSketch *sk) {
-  if (sk) {
-    free(sk->hashes);
+      insert_hash_pool(pool, h);
   }
 }
 
@@ -278,8 +198,9 @@ void reverb_sketch_free(ReverbSketch *sk) {
 // ==============================================================
 
 /* Calculate distance between two sketch sets */
-ReverbDistResult reverb_dist(const ReverbSketch *ref, const ReverbSketch *query,
-                             uint32_t kmer_size) {
+ReverbDistResult calculate_reverb_dist(const ReverbSketch *ref,
+                                       const ReverbSketch *query,
+                                       uint32_t kmer_size) {
   ReverbDistResult res = {0.0, 1.0, 0};
 
   size_t shared = 0, i = 0, j = 0;
@@ -312,7 +233,7 @@ ReverbDistResult reverb_dist(const ReverbSketch *ref, const ReverbSketch *query,
 // Union-find algorithm to determine two nodes are in same set or not
 // ==============================================================
 
-void uf_init(UnionFind *uf, size_t n) {
+void init_unionfind(UnionFind *uf, size_t n) {
   uf->n = n;
   uf->parent = (uint32_t *)malloc(n * sizeof(uint32_t));
   uf->rank = (uint32_t *)calloc(n, sizeof(uint32_t));
@@ -320,7 +241,7 @@ void uf_init(UnionFind *uf, size_t n) {
     uf->parent[i] = (uint32_t)i;
 }
 
-uint32_t uf_find(UnionFind *uf, uint32_t x) {
+uint32_t find_unionfind(UnionFind *uf, uint32_t x) {
   while (uf->parent[x] != x) {
     uf->parent[x] = uf->parent[uf->parent[x]]; /* path splitting */
     x = uf->parent[x];
@@ -328,9 +249,9 @@ uint32_t uf_find(UnionFind *uf, uint32_t x) {
   return x;
 }
 
-void uf_union(UnionFind *uf, uint32_t a, uint32_t b) {
-  a = uf_find(uf, a);
-  b = uf_find(uf, b);
+void union_unionfind(UnionFind *uf, uint32_t a, uint32_t b) {
+  a = find_unionfind(uf, a);
+  b = find_unionfind(uf, b);
   if (a == b)
     return;
   if (uf->rank[a] < uf->rank[b])
@@ -340,7 +261,7 @@ void uf_union(UnionFind *uf, uint32_t a, uint32_t b) {
     uf->rank[a]++;
 }
 
-void uf_free(UnionFind *uf) {
+void free_unionfind(UnionFind *uf) {
   free(uf->parent);
   free(uf->rank);
 }
@@ -389,7 +310,7 @@ typedef struct {
 // INVERTED HASH INDEX
 // ==============================================================
 
-static int cmp_hash_window_entry(const void *a, const void *b) {
+static int compare_hash_entry(const void *a, const void *b) {
   const HashWindowEntry *ea = (const HashWindowEntry *)a,
                         *eb = (const HashWindowEntry *)b;
   return ea->hash != eb->hash ? CMP(ea->hash, eb->hash)
@@ -397,7 +318,7 @@ static int cmp_hash_window_entry(const void *a, const void *b) {
 }
 
 typedef struct {
-  const SketchStore *store;
+  const uint64_t *all_hashes;
   WindowCoord *coords;
   HashWindowEntry *entries;
   size_t total_entries;
@@ -412,26 +333,23 @@ typedef struct {
 
 KHASH_MAP_INIT_INT(u32, uint16_t)
 
-/* Helper: compute distance between two windows using SketchStore */
-static ReverbDistResult skstore_dist(const SketchStore *store,
-                                     const WindowCoord *wa,
-                                     const WindowCoord *wb,
-                                     uint32_t kmer_size) {
+/* Helper: compute distance between two windows using in-memory hashes */
+static ReverbDistResult calculate_window_dist(const uint64_t *all_hashes,
+                                              const WindowCoord *wa,
+                                              const WindowCoord *wb,
+                                              uint32_t kmer_size) {
   ReverbSketch sa = {.sketch_size = wa->sketch_size,
-                     .hashes = (uint64_t *)skstore_get(store, wa->sketch_offset,
-                                                       wa->sketch_size)};
+                     .hashes = (uint64_t *)(all_hashes + wa->sketch_offset)};
   ReverbSketch sb = {.sketch_size = wb->sketch_size,
-                     .hashes = (uint64_t *)skstore_get(store, wb->sketch_offset,
-                                                       wb->sketch_size)};
-  return reverb_dist(&sa, &sb, kmer_size);
+                     .hashes = (uint64_t *)(all_hashes + wb->sketch_offset)};
+  return calculate_reverb_dist(&sa, &sb, kmer_size);
 }
 
-static void edge_worker(void *data, long i, int tid) {
+static void process_edge(void *data, long i, int tid) {
   EdgeWorkerData *w = (EdgeWorkerData *)data;
   uint32_t a = (uint32_t)i;
 
-  const uint64_t *a_hashes = skstore_get(w->store, w->coords[a].sketch_offset,
-                                         w->coords[a].sketch_size);
+  const uint64_t *a_hashes = w->all_hashes + w->coords[a].sketch_offset;
 
   khash_t(u32) *counts = kh_init(u32);
   int ret;
@@ -479,8 +397,8 @@ static void edge_worker(void *data, long i, int tid) {
     if (cnt >= 2) {
       if (w->coords[a].seq_id != w->coords[b].seq_id ||
           ABS_DIFF(w->coords[a].start, w->coords[b].start) >= w->window_size) {
-        ReverbDistResult d =
-            skstore_dist(w->store, &w->coords[a], &w->coords[b], w->kmer_size);
+        ReverbDistResult d = calculate_window_dist(w->all_hashes, &w->coords[a],
+                                                   &w->coords[b], w->kmer_size);
         if (d.distance < w->max_dist) {
           DA_PUSH(w->t_edges[tid], w->t_n_edges[tid], w->t_cap_edges[tid],
                   ((ReverbDupEdge){a, b, d.distance}));
@@ -493,15 +411,14 @@ static void edge_worker(void *data, long i, int tid) {
 }
 
 /* Build inverted hash index and find candidate pairs.
- * Uses SketchStore (mmap-backed) instead of in-memory sketch arrays.
+ * Uses fully in-memory arrays for straightforward computation.
  * Returns edges where distance < max_dist, excluding adjacent windows
  * on the same chromosome. */
-static size_t build_candidate_edges(const SketchStore *store,
+static size_t build_candidate_edges(const uint64_t *all_hashes,
                                     WindowCoord *coords, size_t n_windows,
                                     double max_dist, size_t window_size,
                                     int n_threads, uint32_t kmer_size,
-                                    ReverbDupEdge **out_edges,
-                                    const char *out_prefix) {
+                                    ReverbDupEdge **out_edges) {
   /* 1. Flatten all (hash, window_id) entries */
   size_t total_entries = 0;
   for (size_t i = 0; i < n_windows; i++)
@@ -512,22 +429,16 @@ static size_t build_candidate_edges(const SketchStore *store,
     return 0;
   }
 
-  /* Use file-backed mmap for entries — OS manages physical memory via paging */
+  /* Allocate entries in memory directly */
   size_t entries_bytes = total_entries * sizeof(HashWindowEntry);
-  char entries_path[PATH_MAX];
-  snprintf(entries_path, sizeof(entries_path), "%s.idx.tmp", out_prefix);
-  int entries_fd = open(entries_path, O_RDWR | O_CREAT | O_TRUNC, 0600);
-  ftruncate(entries_fd, entries_bytes);
-  HashWindowEntry *entries = mmap(NULL, entries_bytes, PROT_READ | PROT_WRITE,
-                                  MAP_SHARED, entries_fd, 0);
+  HashWindowEntry *entries = malloc(entries_bytes);
 
-  fprintf(stderr, "[reverb] Building inverted index: %.1f MB (%zu entries)\n",
+  fprintf(stderr, "[INFO] Built inverted hash index: %.1f MB (%zu entries)\n",
           entries_bytes / (1024.0 * 1024.0), total_entries);
 
   size_t idx = 0;
   for (size_t i = 0; i < n_windows; i++) {
-    const uint64_t *hashes =
-        skstore_get(store, coords[i].sketch_offset, coords[i].sketch_size);
+    const uint64_t *hashes = all_hashes + coords[i].sketch_offset;
     for (uint32_t j = 0; j < coords[i].sketch_size; j++) {
       entries[idx++] =
           (HashWindowEntry){.hash = hashes[j], .window_id = (uint32_t)i};
@@ -535,13 +446,11 @@ static size_t build_candidate_edges(const SketchStore *store,
   }
 
   /* 2. Sort by hash value */
-  qsort(entries, total_entries, sizeof(HashWindowEntry), cmp_hash_window_entry);
-  /* After sort, advise random access for binary searches */
-  madvise(entries, entries_bytes, MADV_RANDOM);
+  qsort(entries, total_entries, sizeof(HashWindowEntry), compare_hash_entry);
 
   /* 3. Parallel distance computation using query-driven search */
   EdgeWorkerData w;
-  w.store = store;
+  w.all_hashes = all_hashes;
   w.coords = coords;
   w.entries = entries;
   w.total_entries = total_entries;
@@ -553,10 +462,8 @@ static size_t build_candidate_edges(const SketchStore *store,
   w.t_n_edges = calloc(n_threads, sizeof(size_t));
   w.t_cap_edges = calloc(n_threads, sizeof(size_t));
 
-  kt_for(n_threads, edge_worker, &w, n_windows);
-  munmap(entries, entries_bytes);
-  close(entries_fd);
-  unlink(entries_path);
+  kt_for(n_threads, process_edge, &w, n_windows);
+  free(entries);
 
   size_t n_edges = 0;
   for (int t = 0; t < n_threads; t++)
@@ -589,7 +496,7 @@ static size_t build_candidate_edges(const SketchStore *store,
 // DUP: SEGMENT MERGE
 // ==============================================================
 
-static int cmp_dup_region(const void *a, const void *b) {
+static int compare_dup_region(const void *a, const void *b) {
   const ReverbDupRegion *ra = (const ReverbDupRegion *)a,
                         *rb = (const ReverbDupRegion *)b;
   int c = strcmp(ra->chrom, rb->chrom);
@@ -602,7 +509,7 @@ static size_t merge_dup_regions(ReverbDupRegion *regions, size_t n) {
   if (n <= 1)
     return n;
 
-  qsort(regions, n, sizeof(ReverbDupRegion), cmp_dup_region);
+  qsort(regions, n, sizeof(ReverbDupRegion), compare_dup_region);
 
   size_t out = 0;
   for (size_t i = 1; i < n; i++) {
@@ -611,8 +518,6 @@ static size_t merge_dup_regions(ReverbDupRegion *regions, size_t n) {
         regions[i].start <= regions[out].end) {
       if (regions[i].end > regions[out].end)
         regions[out].end = regions[i].end;
-      regions[out].avg_distance =
-          (regions[out].avg_distance + regions[i].avg_distance) / 2.0;
       free(regions[i].cluster_id);
     } else {
       out++;
@@ -627,66 +532,6 @@ static size_t merge_dup_regions(ReverbDupRegion *regions, size_t n) {
 // CMD: DUP
 // ==============================================================
 
-#include <ctype.h>
-#include <dirent.h>
-#include <stdint.h>
-#include <sys/stat.h>
-
-static int cmp_natural(const void *p1, const void *p2) {
-  const char *a = *(const char **)p1;
-  const char *b = *(const char **)p2;
-  while (*a && *b) {
-    if (isdigit((unsigned char)*a) && isdigit((unsigned char)*b)) {
-      char *ea, *eb;
-      long va = strtol(a, &ea, 10);
-      long vb = strtol(b, &eb, 10);
-      if (va != vb)
-        return va - vb;
-      a = ea;
-      b = eb;
-    } else {
-      int ca = tolower((unsigned char)*a);
-      int cb = tolower((unsigned char)*b);
-      if (ca != cb)
-        return ca - cb;
-      a++;
-      b++;
-    }
-  }
-  return *a - *b;
-}
-
-static void hsv2rgb(float h, float s, float v, float *r, float *g, float *b) {
-  int i = (int)(h * 6);
-  float f = h * 6 - i;
-  float p = v * (1 - s);
-  float q = v * (1 - f * s);
-  float t = v * (1 - (1 - f) * s);
-  switch (i % 6) {
-  case 0:
-    *r = v, *g = t, *b = p;
-    break;
-  case 1:
-    *r = q, *g = v, *b = p;
-    break;
-  case 2:
-    *r = p, *g = v, *b = t;
-    break;
-  case 3:
-    *r = p, *g = q, *b = v;
-    break;
-  case 4:
-    *r = t, *g = p, *b = v;
-    break;
-  case 5:
-    *r = v, *g = p, *b = q;
-    break;
-  default:
-    *r = 0, *g = 0, *b = 0;
-    break;
-  }
-}
-
 static void get_basename(const char *filename, char *basename, size_t size) {
   const char *slash = strrchr(filename, '/');
   const char *base = slash ? slash + 1 : filename;
@@ -700,14 +545,16 @@ static void get_basename(const char *filename, char *basename, size_t size) {
 typedef struct {
   char *genome;
   char *seq;
-  size_t length;
 } GenomeSeqLen;
 
-static int dup_stream_pangenome(
-    const char *filename, const char *bname, const Reverb *r, uint64_t scale,
-    size_t window_size, size_t step_size, size_t min_bases, SketchStore *store,
-    WindowCoord **coords, size_t *num_sketches, size_t *cap_sketches,
-    FILE *bed_fp, GenomeSeqLen **seq_lens, size_t *num_seqs, size_t *cap_seqs) {
+static int stream_pangenome(const char *filename, const char *bname,
+                            const Reverb *r, uint64_t scale, size_t window_size,
+                            size_t step_size, size_t min_bases,
+                            uint64_t **all_hashes, size_t *num_all_hashes,
+                            size_t *cap_all_hashes, WindowCoord **coords,
+                            size_t *num_sketches, size_t *cap_sketches,
+                            FILE *bed_fp, GenomeSeqLen **seq_lens,
+                            size_t *num_seqs, size_t *cap_seqs) {
   gzFile fp = gzopen(filename, "r");
   if (!fp)
     return -1;
@@ -728,7 +575,6 @@ static int dup_stream_pangenome(
     }
     (*seq_lens)[*num_seqs].genome = strdup(bname);
     (*seq_lens)[*num_seqs].seq = strdup(ks->name.s);
-    (*seq_lens)[*num_seqs].length = len;
     (*num_seqs)++;
 
     for (size_t i = 0; i + window_size <= len; i += step_size) {
@@ -757,15 +603,25 @@ static int dup_stream_pangenome(
 
       /* Extract sketch, write to disk, free immediately */
       HashPool pool;
-      pool_init(&pool, UINT64_MAX / scale);
-      extract_and_insert(r, &pool, (const uint8_t *)ks->seq.s + i, window_size);
+      init_hash_pool(&pool, UINT64_MAX / scale);
+      extract_hash(r, &pool, (const uint8_t *)ks->seq.s + i, window_size);
 
       uint64_t *hashes = NULL;
       size_t sketch_size = 0;
-      pool_finalize(&pool, &hashes, &sketch_size);
+      finalize_hash_pool(&pool, &hashes, &sketch_size);
 
       if (sketch_size > 0) {
-        wc->sketch_offset = skstore_write(store, hashes, sketch_size);
+        size_t hash_idx = *num_all_hashes;
+        while (*num_all_hashes + sketch_size > *cap_all_hashes) {
+          *cap_all_hashes =
+              (*cap_all_hashes == 0) ? 1048576 : (*cap_all_hashes * 2);
+          *all_hashes =
+              realloc(*all_hashes, (*cap_all_hashes) * sizeof(uint64_t));
+        }
+        memcpy(*all_hashes + hash_idx, hashes, sketch_size * sizeof(uint64_t));
+        *num_all_hashes += sketch_size;
+
+        wc->sketch_offset = hash_idx;
         wc->sketch_size = (uint32_t)sketch_size;
         free(hashes);
         (*num_sketches)++;
@@ -780,9 +636,9 @@ static int dup_stream_pangenome(
   return 0;
 }
 
-static void do_pass2(char **files, int num_files, const Reverb *r,
-                     uint64_t scale, ReverbDupRegion *regions, size_t n_regions,
-                     size_t flank_size) {
+static void extract_flankings(char **files, int num_files, const Reverb *r,
+                              uint64_t scale, ReverbDupRegion *regions,
+                              size_t n_regions, size_t flank_size) {
   for (int f = 0; f < num_files; f++) {
     char bname[256];
     get_basename(files[f], bname, sizeof(bname));
@@ -821,10 +677,10 @@ static void do_pass2(char **files, int num_files, const Reverb *r,
           // flank_sketch fields removed for memory optimization
 
           HashPool pool;
-          pool_init(&pool, UINT64_MAX / scale);
-          extract_and_insert(r, &pool, flank_seq, left_len + right_len);
-          pool_finalize(&pool, &regions[i].flank_sketch.hashes,
-                        &regions[i].flank_sketch.sketch_size);
+          init_hash_pool(&pool, UINT64_MAX / scale);
+          extract_hash(r, &pool, flank_seq, left_len + right_len);
+          finalize_hash_pool(&pool, &regions[i].flank_sketch.hashes,
+                             &regions[i].flank_sketch.sketch_size);
 
           free(flank_seq);
         }
@@ -849,7 +705,7 @@ typedef struct {
   uint32_t kmer_size;
 } SubclusterData;
 
-static void subcluster_worker(void *data, long i, int tid) {
+static void process_subcluster(void *data, long i, int tid) {
   SubclusterData *w = (SubclusterData *)data;
   if (w->regions[i].flank_sketch.sketch_size == 0)
     return;
@@ -859,8 +715,8 @@ static void subcluster_worker(void *data, long i, int tid) {
     if (w->regions[j].flank_sketch.sketch_size == 0)
       continue;
 
-    ReverbDistResult d = reverb_dist(&w->regions[i].flank_sketch,
-                                     &w->regions[j].flank_sketch, w->kmer_size);
+    ReverbDistResult d = calculate_reverb_dist(
+        &w->regions[i].flank_sketch, &w->regions[j].flank_sketch, w->kmer_size);
     if (d.distance < w->max_dist) {
       DA_PUSH(w->t_pairs[tid], w->t_n_pairs[tid], w->t_cap_pairs[tid],
               ((SubclusterPair){(uint32_t)i, (uint32_t)j}));
@@ -868,11 +724,11 @@ static void subcluster_worker(void *data, long i, int tid) {
   }
 }
 
-static void do_subclustering(ReverbDupRegion *regions, size_t n_merged,
-                             double max_dist, int n_threads,
-                             uint32_t kmer_size) {
+static void perform_subclustering(ReverbDupRegion *regions, size_t n_merged,
+                                  double max_dist, int n_threads,
+                                  uint32_t kmer_size) {
   UnionFind sub_uf;
-  uf_init(&sub_uf, n_merged);
+  init_unionfind(&sub_uf, n_merged);
 
   SubclusterData w;
   w.regions = regions;
@@ -883,11 +739,11 @@ static void do_subclustering(ReverbDupRegion *regions, size_t n_merged,
   w.t_n_pairs = calloc(n_threads, sizeof(size_t));
   w.t_cap_pairs = calloc(n_threads, sizeof(size_t));
 
-  kt_for(n_threads, subcluster_worker, &w, n_merged);
+  kt_for(n_threads, process_subcluster, &w, n_merged);
 
   for (int t = 0; t < n_threads; t++) {
     for (size_t k = 0; k < w.t_n_pairs[t]; k++) {
-      uf_union(&sub_uf, w.t_pairs[t][k].i, w.t_pairs[t][k].j);
+      union_unionfind(&sub_uf, w.t_pairs[t][k].i, w.t_pairs[t][k].j);
     }
     if (w.t_pairs[t])
       free(w.t_pairs[t]);
@@ -901,361 +757,25 @@ static void do_subclustering(ReverbDupRegion *regions, size_t n_merged,
   uint32_t current_id = 1;
 
   for (size_t i = 0; i < n_merged; i++) {
-    uint32_t p = uf_find(&sub_uf, i);
+    uint32_t p = find_unionfind(&sub_uf, i);
     if (mapping[p] == 0) {
       mapping[p] = current_id++;
     }
     regions[i].subcluster_id = mapping[p];
   }
   free(mapping);
-  uf_free(&sub_uf);
+  free_unionfind(&sub_uf);
 }
 
-typedef struct {
-  char name[256];
-  uint8_t *vector;
-} GenomeVector;
-
-static void natural_sort_genomes(GenomeVector *gv, int num_genomes,
-                                 int num_subclusters) {
-  // Nearest-neighbor TSP starting from 0
-  if (num_genomes <= 1)
-    return;
-
-  int *visited = calloc(num_genomes, sizeof(int));
-  visited[0] = 1; // start with rep
-
-  GenomeVector *ordered = malloc(num_genomes * sizeof(GenomeVector));
-  ordered[0] = gv[0];
-
-  int last_idx = 0;
-  for (int i = 1; i < num_genomes; i++) {
-    int best_j = -1;
-    int min_dist = 1e9;
-
-    for (int j = 1; j < num_genomes; j++) {
-      if (visited[j])
-        continue;
-      int dist = 0;
-      for (int k = 1; k <= num_subclusters; k++) {
-        if (gv[last_idx].vector[k] != gv[j].vector[k])
-          dist++;
-      }
-      if (dist < min_dist) {
-        min_dist = dist;
-        best_j = j;
-      }
-    }
-
-    visited[best_j] = 1;
-    ordered[i] = gv[best_j];
-    last_idx = best_j;
-  }
-
-  for (int i = 0; i < num_genomes; i++) {
-    gv[i] = ordered[i];
-  }
-  free(ordered);
-  free(visited);
-}
-
-static void generate_svg(const char *filename, ReverbDupRegion *regions,
-                         size_t n_merged, const char *target_cluster,
-                         GenomeVector *gv, int num_genomes,
-                         const char **chr_suffixes, int num_chrs,
-                         int *chr_lengths) {
-  FILE *fp = fopen(filename, "w");
-  if (!fp)
-    return;
-
-  int col_width = 150; // Fixed column width to avoid squishing
-  int width = 200 + num_chrs * col_width;
-  int height = 50 * num_genomes + 100;
-  fprintf(
-      fp,
-      "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"%d\" height=\"%d\">\n",
-      width, height);
-  fprintf(fp, "<style>text { font-family: Arial; font-size: 14px; }</style>\n");
-  fprintf(fp, "<rect width=\"100%%\" height=\"100%%\" fill=\"white\" />\n");
-
-  char title[256];
-  get_basename(filename, title, sizeof(title));
-  fprintf(fp,
-          "<text x=\"10\" y=\"20\" font-weight=\"bold\" "
-          "font-size=\"16px\">%s</text>\n",
-          title);
-
-  // Draw Y axis labels
-  for (int i = 0; i < num_genomes; i++) {
-    int y = 50 + i * 50;
-    fprintf(fp, "<text x=\"10\" y=\"%d\">%s</text>\n", y + 5, gv[i].name);
-  }
-
-  // Draw chromosomes
-  for (int c = 0; c < num_chrs; c++) {
-    int x_offset = 200 + c * col_width;
-    fprintf(fp, "<text x=\"%d\" y=\"30\" fill=\"#888888\">%s</text>\n",
-            x_offset, chr_suffixes[c]);
-
-    for (int i = 0; i < num_genomes; i++) {
-      int y = 50 + i * 50;
-      int max_len =
-          chr_lengths[i * num_chrs + c]; // length of this chr in this genome
-      if (max_len > 0) {
-        // scale max_len to col_width
-        double scale = (double)(col_width - 20) / max_len;
-        fprintf(fp,
-                "<line x1=\"%d\" y1=\"%d\" x2=\"%d\" y2=\"%d\" "
-                "stroke=\"#e0e0e0\" stroke-width=\"20\" />\n",
-                x_offset, y, x_offset + (int)(max_len * scale), y);
-      }
-    }
-  }
-
-  // Draw family members
-  for (size_t r = 0; r < n_merged; r++) {
-    if (target_cluster && strcmp(regions[r].cluster_id, target_cluster) != 0)
-      continue;
-
-    int y_idx = -1;
-    int bname_len = 0;
-    for (int i = 0; i < num_genomes; i++) {
-      int len = strlen(gv[i].name);
-      if (strncmp(regions[r].chrom, gv[i].name, len) == 0 &&
-          regions[r].chrom[len] == '-') {
-        y_idx = i;
-        bname_len = len;
-        break;
-      }
-    }
-    if (y_idx == -1)
-      continue;
-
-    // Find chr column
-    const char *suffix = regions[r].chrom + bname_len + 1;
-    int c_idx = -1;
-    for (int c = 0; c < num_chrs; c++) {
-      if (strcmp(chr_suffixes[c], suffix) == 0) {
-        c_idx = c;
-        break;
-      }
-    }
-    if (c_idx == -1)
-      continue;
-
-    int y = 50 + y_idx * 50;
-    int x_offset = 200 + c_idx * col_width;
-    int max_len = chr_lengths[y_idx * num_chrs + c_idx];
-    if (max_len == 0)
-      continue;
-    double scale = (double)(col_width - 20) / max_len;
-
-    double p_start = regions[r].start;
-    double p_end = regions[r].end;
-
-    int x1 = x_offset + (int)(p_start * scale);
-    int x2 = x_offset + (int)(p_end * scale);
-    if (x2 - x1 < 5)
-      x2 = x1 + 5;
-
-    // Clamp coordinates to column boundaries
-    if (x1 < x_offset)
-      x1 = x_offset;
-    if (x2 > x_offset + col_width - 20)
-      x2 = x_offset + col_width - 20;
-    if (x1 > x2)
-      continue; // In case it gets completely outside
-
-    float r_c, g_c, b_c;
-    // color based on subcluster_id
-    uint32_t sc = regions[r].subcluster_id;
-    hsv2rgb((sc * 0.618033988749895) - (int)(sc * 0.618033988749895), 0.8, 0.9,
-            &r_c, &g_c, &b_c);
-
-    fprintf(fp,
-            "<line x1=\"%d\" y1=\"%d\" x2=\"%d\" y2=\"%d\" "
-            "stroke=\"rgb(%d,%d,%d)\" stroke-width=\"20\" opacity=\"0.9\" />\n",
-            x1, y, x2, y, (int)(r_c * 255), (int)(g_c * 255), (int)(b_c * 255));
-  }
-
-  fprintf(fp, "</svg>\n");
-  fclose(fp);
-}
-
-static void write_bin(const char *prefix, ReverbDupRegion *regions,
-                      size_t n_merged, GenomeVector *gv, int num_genomes,
-                      const char **chr_suffixes, int num_chrs,
-                      int *chr_lengths) {
-  char path[PATH_MAX];
-  snprintf(path, sizeof(path), "%s.bin", prefix);
-  FILE *fp = fopen(path, "wb");
-  if (!fp)
-    return;
-
-  // Write magic
-  fwrite("REV2", 1, 4, fp);
-
-  // Write genomes
-  fwrite(&num_genomes, sizeof(int), 1, fp);
-  for (int i = 0; i < num_genomes; i++) {
-    int len = strlen(gv[i].name);
-    fwrite(&len, sizeof(int), 1, fp);
-    fwrite(gv[i].name, 1, len, fp);
-  }
-
-  // Write chrs
-  fwrite(&num_chrs, sizeof(int), 1, fp);
-  for (int i = 0; i < num_chrs; i++) {
-    int len = strlen(chr_suffixes[i]);
-    fwrite(&len, sizeof(int), 1, fp);
-    fwrite(chr_suffixes[i], 1, len, fp);
-  }
-  fwrite(chr_lengths, sizeof(int), num_genomes * num_chrs, fp);
-
-  // Write regions
-  fwrite(&n_merged, sizeof(size_t), 1, fp);
-  for (size_t i = 0; i < n_merged; i++) {
-    int chrom_len = strlen(regions[i].chrom);
-    fwrite(&chrom_len, sizeof(int), 1, fp);
-    fwrite(regions[i].chrom, 1, chrom_len, fp);
-    fwrite(&regions[i].start, sizeof(size_t), 1, fp);
-    fwrite(&regions[i].end, sizeof(size_t), 1, fp);
-
-    int cluster_id_len = strlen(regions[i].cluster_id);
-    fwrite(&cluster_id_len, sizeof(int), 1, fp);
-    fwrite(regions[i].cluster_id, 1, cluster_id_len, fp);
-
-    fwrite(&regions[i].subcluster_id, sizeof(uint32_t), 1, fp);
-  }
-  fclose(fp);
-}
-
-int cmd_vis(int argc, char **argv) {
-  if (argc < 2) {
-    fprintf(stderr, "Usage: reverb vis <prefix.bin> <cluster_id|all>\n");
-    return 1;
-  }
-
-  FILE *fp = fopen(argv[1], "rb");
-  if (!fp) {
-    fprintf(stderr, "Cannot open %s\n", argv[1]);
-    return 1;
-  }
-
-  char magic[5] = {0};
-  fread(magic, 1, 4, fp);
-  if (strcmp(magic, "REV2") != 0) {
-    fprintf(stderr, "Invalid bin file\n");
-    return 1;
-  }
-
-  int num_genomes;
-  fread(&num_genomes, sizeof(int), 1, fp);
-  GenomeVector *gv = calloc(num_genomes, sizeof(GenomeVector));
-  for (int i = 0; i < num_genomes; i++) {
-    int len;
-    fread(&len, sizeof(int), 1, fp);
-    fread(gv[i].name, 1, len, fp);
-    gv[i].name[len] = '\0';
-  }
-
-  int num_chrs;
-  fread(&num_chrs, sizeof(int), 1, fp);
-  char **chr_suffixes = malloc(num_chrs * sizeof(char *));
-  for (int i = 0; i < num_chrs; i++) {
-    int len;
-    fread(&len, sizeof(int), 1, fp);
-    char buf[256] = {0};
-    fread(buf, 1, len, fp);
-    chr_suffixes[i] = strdup(buf);
-  }
-
-  int *chr_lengths = malloc(num_genomes * num_chrs * sizeof(int));
-  fread(chr_lengths, sizeof(int), num_genomes * num_chrs, fp);
-
-  size_t n_merged;
-  fread(&n_merged, sizeof(size_t), 1, fp);
-  ReverbDupRegion *regions = calloc(n_merged, sizeof(ReverbDupRegion));
-  for (size_t i = 0; i < n_merged; i++) {
-    int chrom_len;
-    fread(&chrom_len, sizeof(int), 1, fp);
-    char buf[256] = {0};
-    fread(buf, 1, chrom_len, fp);
-    regions[i].chrom = strdup(buf);
-    fread(&regions[i].start, sizeof(size_t), 1, fp);
-    fread(&regions[i].end, sizeof(size_t), 1, fp);
-
-    int cluster_id_len;
-    fread(&cluster_id_len, sizeof(int), 1, fp);
-    char cbuf[512] = {0};
-    fread(cbuf, 1, cluster_id_len, fp);
-    regions[i].cluster_id = strdup(cbuf);
-
-    fread(&regions[i].subcluster_id, sizeof(uint32_t), 1, fp);
-  }
-  fclose(fp);
-  char *target_cluster = NULL;
-  char svg_path[PATH_MAX] = {0};
-
-  if (argc >= 3 && strcmp(argv[2], "all") != 0) {
-    target_cluster = argv[2];
-  }
-
-  if (target_cluster) {
-    snprintf(svg_path, sizeof(svg_path), "%s.svg", target_cluster);
-    generate_svg(svg_path, regions, n_merged, target_cluster, gv, num_genomes,
-                 (const char **)chr_suffixes, num_chrs, chr_lengths);
-    fprintf(stderr, "Wrote %s\n", svg_path);
-  } else {
-    // all
-    char **seen = calloc(n_merged, sizeof(char *));
-    size_t n_seen = 0;
-
-    for (size_t i = 0; i < n_merged; i++) {
-      char *cluster = regions[i].cluster_id;
-      int found = 0;
-      for (size_t j = 0; j < n_seen; j++) {
-        if (strcmp(seen[j], cluster) == 0) {
-          found = 1;
-          break;
-        }
-      }
-      if (!found) {
-        seen[n_seen++] = cluster;
-        snprintf(svg_path, sizeof(svg_path), "%s.svg", cluster);
-        generate_svg(svg_path, regions, n_merged, cluster, gv, num_genomes,
-                     (const char **)chr_suffixes, num_chrs, chr_lengths);
-      }
-    }
-    free(seen);
-    fprintf(stderr, "Wrote SVGs for all families\n");
-  }
-
-  for (int i = 0; i < num_genomes; i++) {
-    free(gv[i].vector);
-  }
-  free(gv);
-  for (int i = 0; i < num_chrs; i++) {
-    free(chr_suffixes[i]);
-  }
-  free(chr_suffixes);
-  free(chr_lengths);
-  for (size_t i = 0; i < n_merged; i++) {
-    free(regions[i].chrom);
-    free(regions[i].cluster_id);
-  }
-  free(regions);
-  return 0;
-}
-
-int cmd_pangenome(int num_files, char **files, size_t flank_size,
+int run_pangenome(int num_files, char **files, size_t flank_size,
                   const Reverb *r, uint64_t scale, size_t window_size,
                   size_t step_size, size_t min_bases, double max_dist,
                   int min_copy, int max_copy, const char *out_prefix,
                   int n_threads) {
 
-  SketchStore sketch_store;
-  skstore_init(&sketch_store, out_prefix);
+  uint64_t *all_hashes = NULL;
+  size_t num_all_hashes = 0, cap_all_hashes = 0;
+
   WindowCoord *coords = NULL;
   size_t num_sketches = 0, cap_sketches = 0;
   ReverbDupEdge *edges = NULL;
@@ -1264,28 +784,27 @@ int cmd_pangenome(int num_files, char **files, size_t flank_size,
   snprintf(path_buf, sizeof(path_buf), "%s.window.bed", out_prefix);
   FILE *bed_fp = fopen(path_buf, "w");
 
-  fprintf(stderr, "[reverb] Extracting windows across pangenome...\n");
+  fprintf(stderr, "[reverb] Extracting windows across pangenome...\\n");
   GenomeSeqLen *seq_lens = NULL;
   size_t num_seqs = 0, cap_seqs = 0;
 
   for (int i = 0; i < num_files; i++) {
     char bname[256];
     get_basename(files[i], bname, sizeof(bname));
-    dup_stream_pangenome(files[i], bname, r, scale, window_size, step_size,
-                         min_bases, &sketch_store, &coords, &num_sketches,
-                         &cap_sketches, bed_fp, &seq_lens, &num_seqs,
-                         &cap_seqs);
+    stream_pangenome(files[i], bname, r, scale, window_size, step_size,
+                     min_bases, &all_hashes, &num_all_hashes, &cap_all_hashes,
+                     &coords, &num_sketches, &cap_sketches, bed_fp, &seq_lens,
+                     &num_seqs, &cap_seqs);
   }
   fclose(bed_fp);
 
-  /* Finalize: mmap the sketch file for random access */
-  skstore_finalize(&sketch_store);
-  fprintf(stderr, "[reverb] Sketches stored on disk: %.1f MB (%zu windows)\n",
-          sketch_store.file_size / (1024.0 * 1024.0), num_sketches);
+  fprintf(
+      stderr, "[reverb] Sketches stored in memory: %.1f MB (%zu windows)\\n",
+      (num_all_hashes * sizeof(uint64_t)) / (1024.0 * 1024.0), num_sketches);
 
-  size_t n_edges = build_candidate_edges(&sketch_store, coords, num_sketches,
-                                         max_dist, window_size, n_threads,
-                                         r->hash_window, &edges, out_prefix);
+  size_t n_edges =
+      build_candidate_edges(all_hashes, coords, num_sketches, max_dist,
+                            window_size, n_threads, r->hash_window, &edges);
 
   uint32_t *genome_id = calloc(num_sketches, sizeof(uint32_t));
   for (size_t i = 0; i < num_sketches; i++) {
@@ -1301,16 +820,16 @@ int cmd_pangenome(int num_files, char **files, size_t flank_size,
 
   // Single Global UnionFind
   UnionFind uf;
-  uf_init(&uf, num_sketches);
+  init_unionfind(&uf, num_sketches);
   for (size_t i = 0; i < n_edges; i++) {
-    uf_union(&uf, edges[i].win_a, edges[i].win_b);
+    union_unionfind(&uf, edges[i].win_a, edges[i].win_b);
   }
 
   // Count instances per genome per family
   uint32_t *max_intra_copy = calloc(num_sketches, sizeof(uint32_t));
   uint32_t *counts = calloc(num_sketches * num_files, sizeof(uint32_t));
   for (size_t i = 0; i < num_sketches; i++) {
-    uint32_t fam = uf_find(&uf, (uint32_t)i);
+    uint32_t fam = find_unionfind(&uf, (uint32_t)i);
     uint32_t g_id = genome_id[i];
     counts[fam * num_files + g_id]++;
     if (counts[fam * num_files + g_id] > max_intra_copy[fam]) {
@@ -1322,9 +841,9 @@ int cmd_pangenome(int num_files, char **files, size_t flank_size,
   uint8_t *final_is_sd = calloc(num_sketches, sizeof(uint8_t));
   char **hub_label = calloc(num_sketches, sizeof(char *));
   uint32_t next_cluster_id = 1;
-  
+
   for (size_t i = 0; i < num_sketches; i++) {
-    uint32_t fam = uf_find(&uf, (uint32_t)i);
+    uint32_t fam = find_unionfind(&uf, (uint32_t)i);
     if (max_intra_copy[fam] >= (uint32_t)min_copy &&
         (max_copy <= 0 || max_intra_copy[fam] <= (uint32_t)max_copy)) {
       final_is_sd[fam] = 1;
@@ -1340,12 +859,12 @@ int cmd_pangenome(int num_files, char **files, size_t flank_size,
 
   uint32_t *comp_size = calloc(num_sketches, sizeof(uint32_t));
   for (size_t i = 0; i < num_sketches; i++)
-    comp_size[uf_find(&uf, (uint32_t)i)]++;
+    comp_size[find_unionfind(&uf, (uint32_t)i)]++;
 
   size_t n_dup_regions = 0, cap_dup_regions = 0;
   ReverbDupRegion *dup_regions = NULL;
   for (size_t i = 0; i < num_sketches; i++) {
-    uint32_t fam = uf_find(&uf, (uint32_t)i);
+    uint32_t fam = find_unionfind(&uf, (uint32_t)i);
     if (!final_is_sd[fam])
       continue;
 
@@ -1361,7 +880,6 @@ int cmd_pangenome(int num_files, char **files, size_t flank_size,
                                .end = coords[i].end,
                                .cluster_id = strdup(label),
                                .copy_count = comp_size[fam],
-                               .avg_distance = 0.0,
                                .subcluster_id = 0,
                                .flank_sketch = {0}}));
   }
@@ -1378,7 +896,7 @@ int cmd_pangenome(int num_files, char **files, size_t flank_size,
   for (size_t i = 0; i < n_edges; i++) {
     uint32_t a = edges[i].win_a;
     uint32_t b = edges[i].win_b;
-    uint32_t fam = uf_find(&uf, a);
+    uint32_t fam = find_unionfind(&uf, a);
     if (!hub_label[fam])
       continue;
 
@@ -1394,12 +912,14 @@ int cmd_pangenome(int num_files, char **files, size_t flank_size,
   }
   fclose(out_bedpe);
 
-  fprintf(stderr, "[reverb] Pass 2: Extracting flanking sequences...\n");
-  do_pass2(files, num_files, r, scale, dup_regions, n_merged,
-           flank_size == 0 ? window_size : flank_size);
+  fprintf(stderr,
+          "[INFO] Extracting flanking sequences for sub-clustering...\n");
+  extract_flankings(files, num_files, r, scale, dup_regions, n_merged,
+                    flank_size == 0 ? window_size / 5 : flank_size);
 
-  fprintf(stderr, "[reverb] Pass 2: Sub-clustering flanking sequences...\n");
-  do_subclustering(dup_regions, n_merged, max_dist, n_threads, r->hash_window);
+  fprintf(stderr, "[INFO] Sub-clustering based on flanking similarities...\n");
+  perform_subclustering(dup_regions, n_merged, max_dist, n_threads,
+                        r->hash_window);
 
   // Output dup.bed
   snprintf(path_buf, sizeof(path_buf), "%s.dup.bed", out_prefix);
@@ -1419,118 +939,17 @@ int cmd_pangenome(int num_files, char **files, size_t flank_size,
   }
   fclose(out_bed);
 
-  // Sort genomes for SVG
-  GenomeVector *gv = calloc(num_files, sizeof(GenomeVector));
-  for (int i = 0; i < num_files; i++) {
-    char bname[256];
-    get_basename(files[i], bname, sizeof(bname));
-    snprintf(gv[i].name, sizeof(gv[i].name), "%s", bname);
-    gv[i].vector = calloc(max_subcluster + 1, sizeof(uint8_t));
-  }
-  for (size_t i = 0; i < n_merged; i++) {
-    int g_idx = -1;
-    for (int g = 0; g < num_files; g++) {
-      int len = strlen(gv[g].name);
-      if (strncmp(dup_regions[i].chrom, gv[g].name, len) == 0 &&
-          dup_regions[i].chrom[len] == '-') {
-        g_idx = g;
-        break;
-      }
-    }
-    if (g_idx != -1) {
-      gv[g_idx].vector[dup_regions[i].subcluster_id] = 1;
-    }
-  }
-
-  natural_sort_genomes(gv, num_files, max_subcluster);
-
-  char **chr_suffixes = NULL;
-  int num_chrs = 0;
-  int cap_chrs = 0;
-  for (size_t i = 0; i < num_seqs; i++) {
-    int found = 0;
-    for (int j = 0; j < num_chrs; j++) {
-      if (strcmp(chr_suffixes[j], seq_lens[i].seq) == 0) {
-        found = 1;
-        break;
-      }
-    }
-    if (!found) {
-      if (num_chrs >= cap_chrs) {
-        cap_chrs = cap_chrs == 0 ? 8 : cap_chrs * 2;
-        chr_suffixes = realloc(chr_suffixes, cap_chrs * sizeof(char *));
-      }
-      chr_suffixes[num_chrs++] = strdup(seq_lens[i].seq);
-    }
-  }
-
-  qsort(chr_suffixes, num_chrs, sizeof(char *), cmp_natural);
-
-  int *chr_lengths = calloc(num_files * num_chrs, sizeof(int));
-  for (size_t i = 0; i < num_seqs; i++) {
-    int y_idx = -1;
-    for (int g = 0; g < num_files; g++) {
-      if (strcmp(gv[g].name, seq_lens[i].genome) == 0) {
-        y_idx = g;
-        break;
-      }
-    }
-    int c_idx = -1;
-    for (int c = 0; c < num_chrs; c++) {
-      if (strcmp(chr_suffixes[c], seq_lens[i].seq) == 0) {
-        c_idx = c;
-        break;
-      }
-    }
-    if (y_idx != -1 && c_idx != -1) {
-      chr_lengths[y_idx * num_chrs + c_idx] = seq_lens[i].length;
-    }
-  }
-
-  fprintf(stderr, "[reverb] Generating SVG visualizations...\n");
-  char dir_buf[PATH_MAX];
-  snprintf(dir_buf, sizeof(dir_buf), "%s_vis", out_prefix);
-  mkdir(dir_buf, 0755);
-
-  // Get unique families
-  char **seen = calloc(n_merged, sizeof(char *));
-  size_t n_seen = 0;
-
-  for (size_t i = 0; i < n_merged; i++) {
-    char *cluster = dup_regions[i].cluster_id;
-    int found = 0;
-    for (size_t j = 0; j < n_seen; j++) {
-      if (strcmp(seen[j], cluster) == 0) {
-        found = 1;
-        break;
-      }
-    }
-    if (!found) {
-      seen[n_seen++] = cluster;
-      size_t svg_len = strlen(dir_buf) + strlen(cluster) + 6;
-      char *svg_path = malloc(svg_len);
-      snprintf(svg_path, svg_len, "%s/%s.svg", dir_buf, cluster);
-      generate_svg(svg_path, dup_regions, n_merged, cluster, gv, num_files,
-                   (const char **)chr_suffixes, num_chrs, chr_lengths);
-      free(svg_path);
-    }
-  }
-  free(seen);
-
-  write_bin(out_prefix, dup_regions, n_merged, gv, num_files,
-            (const char **)chr_suffixes, num_chrs, chr_lengths);
-
   for (size_t i = 0; i < num_sketches; i++) {
     if (hub_label[i])
       free(hub_label[i]);
   }
   free(hub_label);
 
-  skstore_destroy(&sketch_store);
+  free(all_hashes);
   return 0;
 }
 
-int cmd_dup(int argc, char **argv) {
+int run_dup(int argc, char **argv) {
 
   // ==============================================================
   // CLI defaults
@@ -1588,7 +1007,7 @@ int cmd_dup(int argc, char **argv) {
     step_size = window_size / 2;
 
   if (opt.ind == argc) {
-    fprintf(stderr, "Error: input fasta files are required.\n");
+    fprintf(stderr, "[ERROR] Input FASTA files are required.\n");
     return 1;
   }
 
@@ -1596,9 +1015,9 @@ int cmd_dup(int argc, char **argv) {
   char **files = &argv[opt.ind];
 
   Reverb r;
-  reverb_init(&r, def_kmer_size);
+  init_reverb(&r, def_kmer_size);
   r.hash_seed = def_hash_seed;
-  return cmd_pangenome(num_files, files, flank_size, &r, def_scale, window_size,
+  return run_pangenome(num_files, files, flank_size, &r, def_scale, window_size,
                        step_size, min_bases, max_dist, min_copy, max_copy,
                        out_prefix, n_threads);
 }
@@ -1608,9 +1027,6 @@ int cmd_dup(int argc, char **argv) {
 // ==============================================================
 
 int main(int argc, char **argv) {
-  if (argc > 1 && strcmp(argv[1], "vis") == 0) {
-    return cmd_vis(argc - 1, argv + 1);
-  }
 
   if (argc < 2) {
     print_usage();
@@ -1624,5 +1040,5 @@ int main(int argc, char **argv) {
     }
   }
 
-  return cmd_dup(argc, argv);
+  return run_dup(argc, argv);
 }
