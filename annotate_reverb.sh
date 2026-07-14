@@ -23,6 +23,7 @@ trap "rm -rf $TMP_DIR" EXIT
 awk -v pref="$REF_PREFIX" 'BEGIN{OFS="\t"} $1 ~ "^"pref {
     chrom = $1;
     sub("^"pref, "", chrom);
+    sub("^-", "", chrom);
     print chrom, $2, $3, $4, $5, $6;
 }' "$BED_FILE" > "$TMP_DIR/ref.bed"
 
@@ -42,13 +43,14 @@ awk -F'\t' 'BEGIN { OFS="\t" } {
     n = split(attr, a, ";")
     for (i=1; i<=n; i++) {
         sub(/^ +/, "", a[i])
-        if (a[i] ~ /^Name=/) { name = substr(a[i], 6) }
-        else if (a[i] ~ /^family_name=/) { family = substr(a[i], 13) }
-        else if (a[i] ~ /^classification=/) { class = substr(a[i], 16) }
+        lower_a = tolower(a[i])
+        if (lower_a ~ /^name=/) { name = substr(a[i], 6) }
+        else if (lower_a ~ /^family_name=/) { family = substr(a[i], 13) }
+        else if (lower_a ~ /^classification=/) { class = substr(a[i], 16) }
     }
     
-    # If a cluster overlaps multiple TEs, we just keep the first one we see
-    if (!(cluster_id in map)) {
+    # If a cluster overlaps multiple TEs, we keep the first valid one we see
+    if (!(cluster_id in map) || map[cluster_id] ~ /^NA\tNA\tNA/) {
         map[cluster_id] = name "\t" family "\t" class
     }
 }
