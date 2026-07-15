@@ -1027,7 +1027,7 @@ int run_dup(int argc, char **argv) {
   size_t step_size = 0; /* 0 = auto (window/2) */
   size_t min_bases = 1000;
   double max_dist = 0.01;
-  int min_copy = 3;
+  int min_copy = 2;
   int max_copy = 30;
   const char *out_prefix = "reverb";
   size_t flank_size = 0; /* 0 = auto (window/5) */
