@@ -279,7 +279,7 @@ static void print_usage(void) {
          "  -w: window size in bp (default: 5000)\n"
          "  -t: step size in bp (default: window/2)\n"
          "  -b: minimum valid bases per window (default: 1000)\n"
-         "  -d: maximum distance to consider as copy (default: 0.05)\n"
+         "  -d: maximum distance to consider as copy (default: 0.01)\n"
          "  -m: minimum copy count (default: 2)\n"
          "  -M: maximum copy count to filter ubiquitous repeats (default: 30)\n"
          "  -o: output file prefix (default: reverb)\n"
