@@ -54,11 +54,13 @@ typedef struct {
   uint32_t copy_count;
   uint32_t subcluster_id;
   ReverbSketch flank_sketch;
+  uint32_t window_idx;
 } ReverbDupRegion;
 
 void init_reverb(Reverb *r, size_t hash_window);
 ReverbDistResult calculate_reverb_dist(const ReverbSketch *ref,
-                             const ReverbSketch *query, uint32_t kmer_size);
+                                       const ReverbSketch *query,
+                                       uint32_t kmer_size);
 
 /* Union-Find operations */
 void init_unionfind(UnionFind *uf, size_t n);

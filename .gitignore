@@ -1,8 +1,14 @@
 .idea/
 .venv/
+.vscode/
+.cache/
 reverb
 tmp*
 *.fasta
 *.bin
 *.bed*
 *.gff*
+*.exe
+tools/
+compile_commands.json
+.clangd
