@@ -3,6 +3,7 @@
 #include <zlib.h>
 
 #include "klib/ketopt.h"
+#include "klib/khash.h"
 #include "klib/kseq.h"
 #include "reverb.h"
 
@@ -596,19 +597,24 @@ static void perform_subclustering(ReverbDupRegion *regions, size_t n_merged,
 }
 
 // ==============================================================
-// STREAMING O(N^2) DISTANCE
+// PARTITIONED INVERTED INDEX
 // ==============================================================
 
+#define NUM_PARTITIONS 256
+#define MAX_RUN_LEN 100 /* skip ubiquitous hashes */
+
+/* Inverted hash index entry: maps a hash value to its source window */
 typedef struct {
-  const uint64_t *all_hashes;
-  WindowCoord *coords;
-  size_t n_windows;
-  double max_dist;
-  uint32_t kmer_size;
-  ReverbDupEdge **t_edges;
-  size_t *t_n_edges;
-  size_t *t_cap_edges;
-} DistWorkerData;
+  uint64_t hash;
+  uint32_t window_id;
+} HashWindowEntry;
+
+static int compare_hash_entry(const void *a, const void *b) {
+  const HashWindowEntry *ea = (const HashWindowEntry *)a,
+                        *eb = (const HashWindowEntry *)b;
+  return ea->hash != eb->hash ? CMP(ea->hash, eb->hash)
+                              : CMP(ea->window_id, eb->window_id);
+}
 
 /* Helper: compute distance between two windows using in-memory hashes */
 static ReverbDistResult calculate_window_dist(const uint64_t *all_hashes,
@@ -622,47 +628,161 @@ static ReverbDistResult calculate_window_dist(const uint64_t *all_hashes,
   return calculate_reverb_dist(&sa, &sb, kmer_size);
 }
 
-static void process_dist_pair(void *data, long i, int tid) {
-  DistWorkerData *w = (DistWorkerData *)data;
-  uint32_t a = (uint32_t)i;
+/* Binary search: first index where arr[i] >= target */
+static size_t lower_bound_u64(const uint64_t *arr, size_t n, uint64_t target) {
+  size_t lo = 0, hi = n;
+  while (lo < hi) {
+    size_t mid = lo + (hi - lo) / 2;
+    if (arr[mid] < target)
+      lo = mid + 1;
+    else
+      hi = mid;
+  }
+  return lo;
+}
 
-  for (uint32_t b = a + 1; b < w->n_windows; b++) {
-    if (w->coords[a].seq_id == w->coords[b].seq_id &&
-        w->coords[b].start <
-            w->coords[a].start + w->coords[a].end - w->coords[a].start) {
-      // Note: the original condition was ABS_DIFF(start, start) < window_size
-      if ((w->coords[b].start > w->coords[a].start
-               ? w->coords[b].start - w->coords[a].start
-               : w->coords[a].start - w->coords[b].start) <
-          (w->coords[a].end - w->coords[a].start)) {
-        continue;
+/* Candidate pair stored as single uint64: (min << 32) | max */
+static inline uint64_t encode_pair(uint32_t a, uint32_t b) {
+  return a < b ? ((uint64_t)a << 32) | b : ((uint64_t)b << 32) | a;
+}
+
+/* khash set for uint64_t keys (candidate pair deduplication) */
+KHASH_SET_INIT_INT64(pair_set)
+
+/* Phase 1: Discover candidate pairs via partitioned inverted index.
+ * Scans the hash value space in NUM_PARTITIONS chunks. For each chunk,
+ * builds a small sorted inverted index and emits candidate pairs that
+ * share at least one hash. Pairs are deduplicated across partitions
+ * using a hash set. Per-window hashes are already sorted by
+ * finalize_hash_pool, so we use binary search to extract each
+ * partition's hashes in O(log S) per window. */
+static size_t discover_candidates(const uint64_t *all_hashes,
+                                  WindowCoord *coords, size_t n_windows,
+                                  size_t window_size, uint64_t **out_pairs) {
+  khash_t(pair_set) *seen = kh_init(pair_set);
+
+  /* Result array of encoded candidate pairs */
+  uint64_t *pairs = NULL;
+  size_t n_pairs = 0, cap_pairs = 0;
+
+  /* Partition boundaries: divide [0, UINT64_MAX] into NUM_PARTITIONS */
+  uint64_t part_size = UINT64_MAX / NUM_PARTITIONS;
+
+  for (int p = 0; p < NUM_PARTITIONS; p++) {
+    uint64_t lo = part_size * (uint64_t)p;
+    uint64_t hi = (p == NUM_PARTITIONS - 1) ? UINT64_MAX
+                                            : part_size * (uint64_t)(p + 1) - 1;
+
+    /* Collect (hash, window_id) entries falling in [lo, hi] */
+    HashWindowEntry *entries = NULL;
+    size_t n_entries = 0, cap_entries = 0;
+
+    for (size_t w = 0; w < n_windows; w++) {
+      const uint64_t *h = all_hashes + coords[w].sketch_offset;
+      size_t sz = coords[w].sketch_size;
+
+      /* Binary search for the range [lo, hi] within this window's
+       * sorted hashes */
+      size_t start = lower_bound_u64(h, sz, lo);
+      size_t end = lower_bound_u64(h, sz, hi + 1 > hi ? hi + 1 : UINT64_MAX);
+      /* handle hi == UINT64_MAX: include everything to the end */
+      if (hi == UINT64_MAX)
+        end = sz;
+
+      for (size_t k = start; k < end; k++) {
+        DA_PUSH(entries, n_entries, cap_entries,
+                ((HashWindowEntry){h[k], (uint32_t)w}));
       }
     }
 
-    ReverbDistResult d = calculate_window_dist(w->all_hashes, &w->coords[a],
-                                               &w->coords[b], w->kmer_size);
-    if (d.distance < w->max_dist) {
-      DA_PUSH(w->t_edges[tid], w->t_n_edges[tid], w->t_cap_edges[tid],
-              ((ReverbDupEdge){a, b, d.distance}));
+    if (n_entries == 0) {
+      free(entries);
+      continue;
     }
+
+    /* Sort by hash value within this partition */
+    qsort(entries, n_entries, sizeof(HashWindowEntry), compare_hash_entry);
+
+    /* Scan runs of identical hashes to find candidate pairs */
+    size_t i = 0;
+    while (i < n_entries) {
+      size_t j = i + 1;
+      while (j < n_entries && entries[j].hash == entries[i].hash)
+        j++;
+      size_t run_len = j - i;
+
+      if (run_len >= 2 && run_len <= MAX_RUN_LEN) {
+        for (size_t a = i; a < j; a++) {
+          for (size_t b = a + 1; b < j; b++) {
+            uint32_t wa = entries[a].window_id;
+            uint32_t wb = entries[b].window_id;
+            /* Skip overlapping windows on same chromosome */
+            if (coords[wa].seq_id == coords[wb].seq_id &&
+                ABS_DIFF(coords[wa].start, coords[wb].start) < window_size)
+              continue;
+
+            /* Deduplicate candidate pair across partitions */
+            uint64_t pk = encode_pair(wa, wb);
+            int ret;
+            kh_put(pair_set, seen, pk, &ret);
+            if (ret) { /* new pair, not seen before */
+              DA_PUSH(pairs, n_pairs, cap_pairs, pk);
+            }
+          }
+        }
+      }
+      i = j;
+    }
+    free(entries);
+  }
+
+  kh_destroy(pair_set, seen);
+  *out_pairs = pairs;
+  return n_pairs;
+}
+
+/* Phase 2 worker: compute distance for a single candidate pair */
+typedef struct {
+  const uint64_t *all_hashes;
+  WindowCoord *coords;
+  uint64_t *pairs;
+  double max_dist;
+  uint32_t kmer_size;
+  ReverbDupEdge **t_edges;
+  size_t *t_n_edges;
+  size_t *t_cap_edges;
+} DistCandidateData;
+
+static void compute_candidate_dist(void *data, long i, int tid) {
+  DistCandidateData *w = (DistCandidateData *)data;
+  uint32_t a = (uint32_t)(w->pairs[i] >> 32);
+  uint32_t b = (uint32_t)(w->pairs[i] & 0xFFFFFFFF);
+
+  ReverbDistResult d = calculate_window_dist(w->all_hashes, &w->coords[a],
+                                             &w->coords[b], w->kmer_size);
+  if (d.distance < w->max_dist) {
+    DA_PUSH(w->t_edges[tid], w->t_n_edges[tid], w->t_cap_edges[tid],
+            ((ReverbDupEdge){a, b, d.distance}));
   }
 }
 
-static void compute_all_distances_to_uf(const uint64_t *all_hashes,
-                                        WindowCoord *coords, size_t n_windows,
-                                        double max_dist, int n_threads,
-                                        uint32_t kmer_size, UnionFind *uf) {
-  DistWorkerData w;
+/* Phase 2: Compute distances for candidate pairs, union into UF */
+static void compute_candidates_to_uf(const uint64_t *all_hashes,
+                                     WindowCoord *coords, uint64_t *pairs,
+                                     size_t n_pairs, double max_dist,
+                                     int n_threads, uint32_t kmer_size,
+                                     UnionFind *uf) {
+  DistCandidateData w;
   w.all_hashes = all_hashes;
   w.coords = coords;
-  w.n_windows = n_windows;
+  w.pairs = pairs;
   w.max_dist = max_dist;
   w.kmer_size = kmer_size;
   w.t_edges = calloc(n_threads, sizeof(ReverbDupEdge *));
   w.t_n_edges = calloc(n_threads, sizeof(size_t));
   w.t_cap_edges = calloc(n_threads, sizeof(size_t));
 
-  kt_for(n_threads, process_dist_pair, &w, n_windows);
+  kt_for(n_threads, compute_candidate_dist, &w, (long)n_pairs);
 
   for (int t = 0; t < n_threads; t++) {
     for (size_t k = 0; k < w.t_n_edges[t]; k++) {
@@ -783,9 +903,16 @@ int run_pangenome(int num_files, char **files, size_t flank_size,
   UnionFind uf;
   init_unionfind(&uf, num_sketches);
 
-  fprintf(stderr, "[reverb] Computing all O(N^2) distances...\n");
-  compute_all_distances_to_uf(all_hashes, coords, num_sketches, max_dist,
-                              n_threads, r->hash_window, &uf);
+  fprintf(stderr, "[reverb] Discovering candidate pairs (partitioned)...\n");
+  uint64_t *cand_pairs = NULL;
+  size_t n_cands = discover_candidates(all_hashes, coords, num_sketches,
+                                       window_size, &cand_pairs);
+  fprintf(stderr,
+          "[reverb] Found %zu candidate pairs, computing distances...\n",
+          n_cands);
+  compute_candidates_to_uf(all_hashes, coords, cand_pairs, n_cands, max_dist,
+                           n_threads, r->hash_window, &uf);
+  free(cand_pairs);
 
   // Count instances per genome per family
   uint32_t *max_intra_copy = calloc(num_sketches, sizeof(uint32_t));
