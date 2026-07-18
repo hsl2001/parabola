@@ -499,6 +499,11 @@ static void extract_flankings(char **files, int num_files, const Reverb *r,
           size_t left_len = start - left_start;
           size_t right_len = right_end - end;
 
+          /* Free previous flanking sketch if being overwritten */
+          free(regions[i].flank_sketch.hashes);
+          regions[i].flank_sketch.hashes = NULL;
+          regions[i].flank_sketch.sketch_size = 0;
+
           uint8_t *flank_seq = malloc(left_len + right_len);
           if (left_len > 0)
             memcpy(flank_seq, ks->seq.s + left_start, left_len);
@@ -820,7 +825,8 @@ static void merge_global_data(StreamWorkerData *workers, int num_files,
                               const char *out_prefix, uint64_t **out_all_hashes,
                               WindowCoord **out_coords,
                               size_t *out_num_sketches,
-                              GenomeSeqLen **out_seq_lens) {
+                              GenomeSeqLen **out_seq_lens,
+                              size_t *out_num_seqs) {
   size_t total_hashes = 0, total_sketches = 0, total_seqs = 0;
   for (int i = 0; i < num_files; i++) {
     total_hashes += workers[i].num_all_hashes;
@@ -828,9 +834,12 @@ static void merge_global_data(StreamWorkerData *workers, int num_files,
     total_seqs += workers[i].num_seqs;
   }
 
-  uint64_t *all_hashes = malloc(total_hashes * sizeof(uint64_t));
-  WindowCoord *coords = malloc(total_sketches * sizeof(WindowCoord));
-  GenomeSeqLen *seq_lens = malloc(total_seqs * sizeof(GenomeSeqLen));
+  uint64_t *all_hashes =
+      total_hashes ? malloc(total_hashes * sizeof(uint64_t)) : NULL;
+  WindowCoord *coords =
+      total_sketches ? malloc(total_sketches * sizeof(WindowCoord)) : NULL;
+  GenomeSeqLen *seq_lens =
+      total_seqs ? malloc(total_seqs * sizeof(GenomeSeqLen)) : NULL;
 
   size_t g_hash_offset = 0;
   size_t g_sketch_offset = 0;
@@ -884,6 +893,7 @@ static void merge_global_data(StreamWorkerData *workers, int num_files,
   *out_coords = coords;
   *out_num_sketches = total_sketches;
   *out_seq_lens = seq_lens;
+  *out_num_seqs = total_seqs;
 }
 
 static void build_duplicate_regions(UnionFind *uf, size_t num_sketches,
@@ -905,13 +915,13 @@ static void build_duplicate_regions(UnionFind *uf, size_t num_sketches,
   }
 
   uint32_t *max_intra_copy = calloc(num_sketches, sizeof(uint32_t));
-  uint32_t *counts = calloc(num_sketches * num_files, sizeof(uint32_t));
+  uint32_t *counts = calloc((size_t)num_sketches * num_files, sizeof(uint32_t));
   for (size_t i = 0; i < num_sketches; i++) {
     uint32_t fam = find_unionfind(uf, (uint32_t)i);
     uint32_t g_id = genome_id[i];
-    counts[fam * num_files + g_id]++;
-    if (counts[fam * num_files + g_id] > max_intra_copy[fam]) {
-      max_intra_copy[fam] = counts[fam * num_files + g_id];
+    counts[(size_t)fam * num_files + g_id]++;
+    if (counts[(size_t)fam * num_files + g_id] > max_intra_copy[fam]) {
+      max_intra_copy[fam] = counts[(size_t)fam * num_files + g_id];
     }
   }
   free(counts);
@@ -978,6 +988,10 @@ static void write_dup_bed(const char *out_prefix, ReverbDupRegion *dup_regions,
   char path_buf[PATH_MAX];
   snprintf(path_buf, sizeof(path_buf), "%s.dup.bed", out_prefix);
   FILE *out_bed = fopen(path_buf, "w");
+  if (!out_bed) {
+    fprintf(stderr, "[ERROR] Cannot open output file: %s\n", path_buf);
+    return;
+  }
 
   fprintf(out_bed,
           "#chrom\tstart\tend\tcluster_id\tsubcluster_id\tcopy_count\n");
@@ -1004,11 +1018,12 @@ int run_pangenome(int num_files, char **files, size_t flank_size,
   WindowCoord *coords = NULL;
   size_t num_sketches = 0;
   GenomeSeqLen *seq_lens = NULL;
+  size_t num_seqs = 0;
 
   StreamWorkerData *workers = extract_all_windows(
       files, num_files, r, scale, window_size, step_size, min_bases, n_threads);
   merge_global_data(workers, num_files, out_prefix, &all_hashes, &coords,
-                    &num_sketches, &seq_lens);
+                    &num_sketches, &seq_lens, &num_seqs);
   free(workers);
 
   UnionFind uf;
@@ -1044,8 +1059,19 @@ int run_pangenome(int num_files, char **files, size_t flank_size,
 
   write_dup_bed(out_prefix, dup_regions, n_merged);
 
+  for (size_t i = 0; i < n_merged; i++) {
+    free(dup_regions[i].chrom);
+    free(dup_regions[i].cluster_id);
+    free(dup_regions[i].flank_sketch.hashes);
+  }
+  free(dup_regions);
+  free_unionfind(&uf);
   free(all_hashes);
   free(coords);
+  for (size_t i = 0; i < num_seqs; i++) {
+    free(seq_lens[i].genome);
+    free(seq_lens[i].seq);
+  }
   free(seq_lens);
   return 0;
 }
