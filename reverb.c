@@ -1031,7 +1031,7 @@ int run_pangenome(int num_files, char **files, size_t flank_size,
   UnionFind uf;
   init_unionfind(&uf, num_sketches);
 
-  fprintf(stderr, "[reverb] Discovering candidate pairs (partitioned)...\n");
+  fprintf(stderr, "[reverb] Discovering candidate pairs ...\n");
   uint64_t *cand_pairs = NULL;
   size_t n_cands = discover_candidates(all_hashes, coords, num_sketches,
                                        window_size, &cand_pairs);
