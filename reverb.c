@@ -12,14 +12,21 @@ void kt_for(int n_threads, void (*func)(void *, long, int), void *data, long n);
 #define MIX_CONST1 0xff51afd7ed558ccdULL
 #define MIX_CONST2 0xc4ceb9fe1a85ec53ULL
 
+/* Generic dynamic-array capacity reserve */
+#define DA_RESERVE(arr, cap, req_cap)                                          \
+  do {                                                                         \
+    if ((req_cap) > (cap)) {                                                   \
+      (cap) = (cap) ? (cap) : 16;                                              \
+      while ((cap) < (req_cap))                                                \
+        (cap) *= 2;                                                            \
+      (arr) = realloc((arr), (cap) * sizeof(*(arr)));                          \
+    }                                                                          \
+  } while (0)
+
 /* Generic dynamic-array push: grows `arr` by doubling `cap` as needed. */
 #define DA_PUSH(arr, n, cap, val)                                              \
   do {                                                                         \
-    /* If exceed capacity */                                                   \
-    if ((n) >= (cap)) {                                                        \
-      (cap) = (cap) ? (cap) * 2 : 1024;                                        \
-      (arr) = realloc((arr), (cap) * sizeof(*(arr)));                          \
-    }                                                                          \
+    DA_RESERVE(arr, cap, (n) + 1);                                             \
     (arr)[(n)++] = (val);                                                      \
   } while (0)
 
@@ -399,10 +406,7 @@ static void stream_pangenome_worker(void *data, long i, int tid) {
   while (kseq_read(ks) >= 0) {
     size_t len = ks->seq.l;
 
-    if (w->num_seqs >= w->cap_seqs) {
-      w->cap_seqs = w->cap_seqs == 0 ? 16 : w->cap_seqs * 2;
-      w->seq_lens = realloc(w->seq_lens, w->cap_seqs * sizeof(GenomeSeqLen));
-    }
+    DA_RESERVE(w->seq_lens, w->cap_seqs, w->num_seqs + 1);
     w->seq_lens[w->num_seqs].genome = strdup(w->bname);
     w->seq_lens[w->num_seqs].seq = strdup(ks->name.s);
     w->num_seqs++;
@@ -418,10 +422,7 @@ static void stream_pangenome_worker(void *data, long i, int tid) {
       if (valid_bases < w->min_bases)
         continue;
 
-      if (w->num_sketches >= w->cap_sketches) {
-        w->cap_sketches = w->cap_sketches == 0 ? 256 : w->cap_sketches * 2;
-        w->coords = realloc(w->coords, w->cap_sketches * sizeof(WindowCoord));
-      }
+      DA_RESERVE(w->coords, w->cap_sketches, w->num_sketches + 1);
 
       WindowCoord *wc = &w->coords[w->num_sketches];
 
@@ -442,12 +443,10 @@ static void stream_pangenome_worker(void *data, long i, int tid) {
 
       if (sketch_size > 0) {
         size_t hash_idx = w->num_all_hashes;
-        while (w->num_all_hashes + sketch_size > w->cap_all_hashes) {
-          w->cap_all_hashes =
-              (w->cap_all_hashes == 0) ? 1048576 : (w->cap_all_hashes * 2);
-          w->all_hashes =
-              realloc(w->all_hashes, (w->cap_all_hashes) * sizeof(uint64_t));
-        }
+        if (w->cap_all_hashes == 0)
+          w->cap_all_hashes = 524288;
+        DA_RESERVE(w->all_hashes, w->cap_all_hashes,
+                   w->num_all_hashes + sketch_size);
         memcpy(w->all_hashes + hash_idx, hashes,
                sketch_size * sizeof(uint64_t));
         w->num_all_hashes += sketch_size;
@@ -481,10 +480,9 @@ static void extract_flankings(char **files, int num_files, const Reverb *r,
       continue;
     }
 
-    int chr_idx = 1;
     while (kseq_read(ks) >= 0) {
       char chr_name[512];
-      snprintf(chr_name, sizeof(chr_name), "%s-Chr%d", bname, chr_idx++);
+      snprintf(chr_name, sizeof(chr_name), "%s-%s", bname, ks->name.s);
 
       for (size_t i = 0; i < n_regions; i++) {
         if (strcmp(regions[i].chrom, chr_name) == 0) {
@@ -502,8 +500,6 @@ static void extract_flankings(char **files, int num_files, const Reverb *r,
             memcpy(flank_seq, ks->seq.s + left_start, left_len);
           if (right_len > 0)
             memcpy(flank_seq + left_len, ks->seq.s + end, right_len);
-
-          // flank_sketch fields removed for memory optimization
 
           HashPool pool;
           init_hash_pool(&pool, UINT64_MAX / scale);
@@ -796,25 +792,12 @@ static void compute_candidates_to_uf(const uint64_t *all_hashes,
   free(w.t_cap_edges);
 }
 
-int run_pangenome(int num_files, char **files, size_t flank_size,
-                  const Reverb *r, uint64_t scale, size_t window_size,
-                  size_t step_size, size_t min_bases, double max_dist,
-                  int min_copy, int max_copy, const char *out_prefix,
-                  int n_threads, uint32_t adjacency_threshold,
-                  double subcluster_dist) {
-
-  uint64_t *all_hashes = NULL;
-
-  WindowCoord *coords = NULL;
-  size_t num_sketches = 0;
-
-  char path_buf[PATH_MAX];
-  snprintf(path_buf, sizeof(path_buf), "%s.window.bed", out_prefix);
-  FILE *bed_fp = fopen(path_buf, "w");
-
-  fprintf(stderr, "[reverb] Extracting windows across pangenome...\\n");
-  GenomeSeqLen *seq_lens = NULL;
-
+static StreamWorkerData *extract_all_windows(char **files, int num_files,
+                                             const Reverb *r, uint64_t scale,
+                                             size_t window_size,
+                                             size_t step_size, size_t min_bases,
+                                             int n_threads) {
+  fprintf(stderr, "[reverb] Extracting windows across pangenome...\n");
   StreamWorkerData *workers = calloc(num_files, sizeof(StreamWorkerData));
   for (int i = 0; i < num_files; i++) {
     workers[i].filename = files[i];
@@ -825,9 +808,15 @@ int run_pangenome(int num_files, char **files, size_t flank_size,
     workers[i].step_size = step_size;
     workers[i].min_bases = min_bases;
   }
-
   kt_for(n_threads, stream_pangenome_worker, workers, num_files);
+  return workers;
+}
 
+static void merge_global_data(StreamWorkerData *workers, int num_files,
+                              const char *out_prefix, uint64_t **out_all_hashes,
+                              WindowCoord **out_coords,
+                              size_t *out_num_sketches,
+                              GenomeSeqLen **out_seq_lens) {
   size_t total_hashes = 0, total_sketches = 0, total_seqs = 0;
   for (int i = 0; i < num_files; i++) {
     total_hashes += workers[i].num_all_hashes;
@@ -835,30 +824,31 @@ int run_pangenome(int num_files, char **files, size_t flank_size,
     total_seqs += workers[i].num_seqs;
   }
 
-  all_hashes = malloc(total_hashes * sizeof(uint64_t));
-  coords = malloc(total_sketches * sizeof(WindowCoord));
-  seq_lens = malloc(total_seqs * sizeof(GenomeSeqLen));
+  uint64_t *all_hashes = malloc(total_hashes * sizeof(uint64_t));
+  WindowCoord *coords = malloc(total_sketches * sizeof(WindowCoord));
+  GenomeSeqLen *seq_lens = malloc(total_seqs * sizeof(GenomeSeqLen));
 
   size_t g_hash_offset = 0;
   size_t g_sketch_offset = 0;
   size_t g_seq_offset = 0;
 
+  char path_buf[PATH_MAX];
+  snprintf(path_buf, sizeof(path_buf), "%s.window.bed", out_prefix);
+  FILE *bed_fp = fopen(path_buf, "w");
+
   for (int i = 0; i < num_files; i++) {
     StreamWorkerData *w = &workers[i];
 
-    // Copy all_hashes
     if (w->num_all_hashes > 0) {
       memcpy(all_hashes + g_hash_offset, w->all_hashes,
              w->num_all_hashes * sizeof(uint64_t));
     }
 
-    // Copy seq_lens
     if (w->num_seqs > 0) {
       memcpy(seq_lens + g_seq_offset, w->seq_lens,
              w->num_seqs * sizeof(GenomeSeqLen));
     }
 
-    // Copy coords and write to bed
     for (size_t j = 0; j < w->num_sketches; j++) {
       WindowCoord c = w->coords[j];
       c.sketch_offset += g_hash_offset;
@@ -882,11 +872,22 @@ int run_pangenome(int num_files, char **files, size_t flank_size,
     free(w->coords);
     free(w->seq_lens);
   }
-  free(workers);
 
-  num_sketches = total_sketches;
-  fclose(bed_fp);
+  if (bed_fp)
+    fclose(bed_fp);
 
+  *out_all_hashes = all_hashes;
+  *out_coords = coords;
+  *out_num_sketches = total_sketches;
+  *out_seq_lens = seq_lens;
+}
+
+static void build_duplicate_regions(UnionFind *uf, size_t num_sketches,
+                                    int num_files, char **files,
+                                    GenomeSeqLen *seq_lens, WindowCoord *coords,
+                                    int min_copy, int max_copy,
+                                    ReverbDupRegion **out_regions,
+                                    size_t *out_n_regions) {
   uint32_t *genome_id = calloc(num_sketches, sizeof(uint32_t));
   for (size_t i = 0; i < num_sketches; i++) {
     for (int f = 0; f < num_files; f++) {
@@ -899,26 +900,10 @@ int run_pangenome(int num_files, char **files, size_t flank_size,
     }
   }
 
-  // Single Global UnionFind
-  UnionFind uf;
-  init_unionfind(&uf, num_sketches);
-
-  fprintf(stderr, "[reverb] Discovering candidate pairs (partitioned)...\n");
-  uint64_t *cand_pairs = NULL;
-  size_t n_cands = discover_candidates(all_hashes, coords, num_sketches,
-                                       window_size, &cand_pairs);
-  fprintf(stderr,
-          "[reverb] Found %zu candidate pairs, computing distances...\n",
-          n_cands);
-  compute_candidates_to_uf(all_hashes, coords, cand_pairs, n_cands, max_dist,
-                           n_threads, r->hash_window, &uf);
-  free(cand_pairs);
-
-  // Count instances per genome per family
   uint32_t *max_intra_copy = calloc(num_sketches, sizeof(uint32_t));
   uint32_t *counts = calloc(num_sketches * num_files, sizeof(uint32_t));
   for (size_t i = 0; i < num_sketches; i++) {
-    uint32_t fam = find_unionfind(&uf, (uint32_t)i);
+    uint32_t fam = find_unionfind(uf, (uint32_t)i);
     uint32_t g_id = genome_id[i];
     counts[fam * num_files + g_id]++;
     if (counts[fam * num_files + g_id] > max_intra_copy[fam]) {
@@ -926,13 +911,16 @@ int run_pangenome(int num_files, char **files, size_t flank_size,
     }
   }
   free(counts);
+  free(genome_id);
 
   uint8_t *final_is_sd = calloc(num_sketches, sizeof(uint8_t));
   char **hub_label = calloc(num_sketches, sizeof(char *));
   uint32_t next_cluster_id = 1;
+  uint32_t *comp_size = calloc(num_sketches, sizeof(uint32_t));
 
   for (size_t i = 0; i < num_sketches; i++) {
-    uint32_t fam = find_unionfind(&uf, (uint32_t)i);
+    uint32_t fam = find_unionfind(uf, (uint32_t)i);
+    comp_size[fam]++;
     if (max_intra_copy[fam] >= (uint32_t)min_copy &&
         (max_copy <= 0 || max_intra_copy[fam] <= (uint32_t)max_copy)) {
       final_is_sd[fam] = 1;
@@ -943,17 +931,12 @@ int run_pangenome(int num_files, char **files, size_t flank_size,
       }
     }
   }
-  free(genome_id);
   free(max_intra_copy);
-
-  uint32_t *comp_size = calloc(num_sketches, sizeof(uint32_t));
-  for (size_t i = 0; i < num_sketches; i++)
-    comp_size[find_unionfind(&uf, (uint32_t)i)]++;
 
   size_t n_dup_regions = 0, cap_dup_regions = 0;
   ReverbDupRegion *dup_regions = NULL;
   for (size_t i = 0; i < num_sketches; i++) {
-    uint32_t fam = find_unionfind(&uf, (uint32_t)i);
+    uint32_t fam = find_unionfind(uf, (uint32_t)i);
     if (!final_is_sd[fam])
       continue;
 
@@ -973,21 +956,22 @@ int run_pangenome(int num_files, char **files, size_t flank_size,
                                .flank_sketch = {0},
                                .window_idx = coords[i].window_idx}));
   }
-
-  size_t n_merged =
-      merge_dup_regions(dup_regions, n_dup_regions, adjacency_threshold);
   free(final_is_sd);
+  free(comp_size);
 
-  fprintf(stderr,
-          "[INFO] Extracting flanking sequences for sub-clustering...\n");
-  extract_flankings(files, num_files, r, scale, dup_regions, n_merged,
-                    flank_size == 0 ? window_size / 5 : flank_size);
+  for (size_t i = 0; i < num_sketches; i++) {
+    if (hub_label[i])
+      free(hub_label[i]);
+  }
+  free(hub_label);
 
-  fprintf(stderr, "[INFO] Sub-clustering based on flanking similarities...\n");
-  perform_subclustering(dup_regions, n_merged, subcluster_dist, n_threads,
-                        r->hash_window);
+  *out_regions = dup_regions;
+  *out_n_regions = n_dup_regions;
+}
 
-  // Output dup.bed
+static void write_dup_bed(const char *out_prefix, ReverbDupRegion *dup_regions,
+                          size_t n_merged) {
+  char path_buf[PATH_MAX];
   snprintf(path_buf, sizeof(path_buf), "%s.dup.bed", out_prefix);
   FILE *out_bed = fopen(path_buf, "w");
 
@@ -1004,14 +988,61 @@ int run_pangenome(int num_files, char **files, size_t flank_size,
       max_subcluster = dup_regions[i].subcluster_id;
   }
   fclose(out_bed);
+}
 
-  for (size_t i = 0; i < num_sketches; i++) {
-    if (hub_label[i])
-      free(hub_label[i]);
-  }
-  free(hub_label);
+int run_pangenome(int num_files, char **files, size_t flank_size,
+                  const Reverb *r, uint64_t scale, size_t window_size,
+                  size_t step_size, size_t min_bases, double max_dist,
+                  int min_copy, int max_copy, const char *out_prefix,
+                  int n_threads, uint32_t adjacency_threshold,
+                  double subcluster_dist) {
+  uint64_t *all_hashes = NULL;
+  WindowCoord *coords = NULL;
+  size_t num_sketches = 0;
+  GenomeSeqLen *seq_lens = NULL;
+
+  StreamWorkerData *workers = extract_all_windows(
+      files, num_files, r, scale, window_size, step_size, min_bases, n_threads);
+  merge_global_data(workers, num_files, out_prefix, &all_hashes, &coords,
+                    &num_sketches, &seq_lens);
+  free(workers);
+
+  UnionFind uf;
+  init_unionfind(&uf, num_sketches);
+
+  fprintf(stderr, "[reverb] Discovering candidate pairs (partitioned)...\n");
+  uint64_t *cand_pairs = NULL;
+  size_t n_cands = discover_candidates(all_hashes, coords, num_sketches,
+                                       window_size, &cand_pairs);
+  fprintf(stderr,
+          "[reverb] Found %zu candidate pairs, computing distances...\n",
+          n_cands);
+  compute_candidates_to_uf(all_hashes, coords, cand_pairs, n_cands, max_dist,
+                           n_threads, r->hash_window, &uf);
+  free(cand_pairs);
+
+  ReverbDupRegion *dup_regions = NULL;
+  size_t n_dup_regions = 0;
+  build_duplicate_regions(&uf, num_sketches, num_files, files, seq_lens, coords,
+                          min_copy, max_copy, &dup_regions, &n_dup_regions);
+
+  size_t n_merged =
+      merge_dup_regions(dup_regions, n_dup_regions, adjacency_threshold);
+
+  fprintf(stderr,
+          "[INFO] Extracting flanking sequences for sub-clustering...\n");
+  extract_flankings(files, num_files, r, scale, dup_regions, n_merged,
+                    flank_size == 0 ? window_size / 5 : flank_size);
+
+  fprintf(stderr, "[INFO] Sub-clustering based on flanking similarities...\n");
+  perform_subclustering(dup_regions, n_merged, subcluster_dist, n_threads,
+                        r->hash_window);
+
+  write_dup_bed(out_prefix, dup_regions, n_merged);
 
   free(all_hashes);
+  free(coords);
+  free(seq_lens);
   return 0;
 }
 
