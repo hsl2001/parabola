@@ -315,8 +315,11 @@ typedef struct {
 static int compare_dup_region(const void *a, const void *b) {
   const ReverbDupRegion *ra = (const ReverbDupRegion *)a,
                         *rb = (const ReverbDupRegion *)b;
-  int c = strcmp(ra->chrom, rb->chrom);
-  return c ? c : CMP(ra->start, rb->start);
+  int c1 = strcmp(ra->cluster_id, rb->cluster_id);
+  if (c1)
+    return c1;
+  int c2 = strcmp(ra->chrom, rb->chrom);
+  return c2 ? c2 : CMP(ra->start, rb->start);
 }
 
 /* Merge adjacent/overlapping regions in the same SD family.
@@ -340,6 +343,7 @@ static size_t merge_dup_regions(ReverbDupRegion *regions, size_t n,
       if (regions[i].window_idx > regions[out].window_idx)
         regions[out].window_idx = regions[i].window_idx;
       free(regions[i].cluster_id);
+      free(regions[i].chrom);
     } else {
       out++;
       if (out != i)
