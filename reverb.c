@@ -447,8 +447,10 @@ static void stream_pangenome_worker(void *data, long i, int tid) {
 
       if (sketch_size > 0) {
         size_t hash_idx = w->num_all_hashes;
-        if (w->cap_all_hashes == 0)
+        if (w->cap_all_hashes == 0) {
           w->cap_all_hashes = 524288;
+          w->all_hashes = malloc(w->cap_all_hashes * sizeof(uint64_t));
+        }
         DA_RESERVE(w->all_hashes, w->cap_all_hashes,
                    w->num_all_hashes + sketch_size);
         memcpy(w->all_hashes + hash_idx, hashes,
