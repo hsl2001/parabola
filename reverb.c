@@ -997,13 +997,13 @@ static void write_dup_bed(const char *out_prefix, ReverbDupRegion *dup_regions,
   }
 
   fprintf(out_bed,
-          "#chrom\tstart\tend\tcluster_id\tsubcluster_id\tcopy_count\n");
+      "#chrom\tstart\tend\tcluster_id\tsubcluster_id\n");
 
   uint32_t max_subcluster = 0;
   for (size_t i = 0; i < n_merged; i++) {
-    fprintf(out_bed, "%s\t%zu\t%zu\t%s\t%u\t%u\n", dup_regions[i].chrom,
-            dup_regions[i].start, dup_regions[i].end, dup_regions[i].cluster_id,
-            dup_regions[i].subcluster_id, dup_regions[i].copy_count);
+        fprintf(out_bed, "%s\t%zu\t%zu\t%s\t%u\n", dup_regions[i].chrom,
+          dup_regions[i].start, dup_regions[i].end,
+          dup_regions[i].cluster_id, dup_regions[i].subcluster_id);
 
     if (dup_regions[i].subcluster_id > max_subcluster)
       max_subcluster = dup_regions[i].subcluster_id;
@@ -1088,10 +1088,10 @@ int run_dup(int argc, char **argv) {
   uint32_t def_kmer_size = 21;
   uint64_t def_scale = 10;
   uint64_t def_hash_seed = 42;
-  size_t window_size = 5000;
+  size_t window_size = 1000;
   size_t step_size = 0; /* 0 = auto (window/2) */
   size_t min_bases = 1000;
-  double max_dist = 0.01;
+  double max_dist = 0.1;
   int min_copy = 2;
   int max_copy = 30;
   const char *out_prefix = "reverb";
