@@ -283,7 +283,7 @@ static void print_usage(void) {
          "Options:\n"
          "  -k: kmer size (default: 21, max: 42)\n"
          "  -s: scale factor (default: 10)\n"
-         "  -w: window size in bp (default: 5000)\n"
+         "  -w: window size in bp (default: 1000)\n"
          "  -t: step size in bp (default: window/2)\n"
          "  -b: minimum valid bases per window (default: 1000)\n"
          "  -d: maximum distance to consider as copy (default: 0.01)\n"
