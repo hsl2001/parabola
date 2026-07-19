@@ -28,15 +28,15 @@ awk -v pref="$REF_PREFIX" 'BEGIN{OFS="\t"} $1 ~ "^"pref {
 }' "$BED_FILE" > "$TMP_DIR/ref.bed"
 
 # 2. Intersect with GFF
-# -wa: write original A entry, -wb: write original B entry
-# A has 6 columns. B (GFF) has 9 columns.
-bedtools intersect -a "$TMP_DIR/ref.bed" -b "$GFF_FILE" -wa -wb > "$TMP_DIR/intersected.txt"
+# -wo: write original A and B entries plus the number of base pairs of overlap.
+# A has 6 columns. B (GFF) has 9 columns. Overlap length is in the 16th column.
+bedtools intersect -a "$TMP_DIR/ref.bed" -b "$GFF_FILE" -wo > "$TMP_DIR/intersected.txt"
 
-# 3. Create a mapping from cluster_id to TE annotation
-# We use awk to extract Name, family_name, and classification from the 15th column (GFF attributes)
-awk -F'\t' 'BEGIN { OFS="\t" } $9 == "mobile_element" {
+# 3. Create a mapping from cluster_id to TE annotation (Max overlap match)
+awk -F'\t' 'BEGIN { OFS="\t" }  {
     cluster_id = $4
     attr = $15
+    overlap_len = $16
     
     name = "NA"; family = "NA"; class = "NA"
     
@@ -49,8 +49,9 @@ awk -F'\t' 'BEGIN { OFS="\t" } $9 == "mobile_element" {
         else if (lower_a ~ /^classification=/ || lower_a ~ /^class=/) { class = substr(a[i], index(a[i], "=")+1) }
     }
     
-    # If a cluster overlaps multiple TEs, we keep the first valid one we see
-    if (!(cluster_id in map) || map[cluster_id] ~ /^NA\tNA\tNA/) {
+    # Overlap 길이가 가장 큰(best match) 주석으로 갱신
+    if (!(cluster_id in max_overlap) || overlap_len > max_overlap[cluster_id]) {
+        max_overlap[cluster_id] = overlap_len
         map[cluster_id] = name "\t" family "\t" class
     }
 }
@@ -61,7 +62,6 @@ END {
 }' "$TMP_DIR/intersected.txt" > "$TMP_DIR/cluster_map.txt"
 
 # 4. Annotate the original BED file
-# We output the original columns + Name + family_name + classification
 echo -e "#chrom\tstart\tend\tcluster_id\tsubcluster_id\tcopy_count\tName\tfamily_name\tclassification"
 
 awk -F'\t' 'BEGIN { OFS="\t" }

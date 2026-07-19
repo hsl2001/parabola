@@ -286,7 +286,7 @@ static void print_usage(void) {
          "  -w: window size in bp (default: 5000)\n"
          "  -t: step size in bp (default: window/2)\n"
          "  -b: minimum valid bases per window (default: 1000)\n"
-         "  -d: maximum distance to consider as copy (default: 0.01)\n"
+         "  -d: maximum distance to consider as copy (default: 0.02)\n"
          "  -D: sub-cluster distance threshold (default: 0.1)\n"
          "  -m: minimum copy count (default: 2)\n"
          "  -M: maximum copy count to filter ubiquitous repeats (default: 30)\n"
@@ -1091,7 +1091,7 @@ int run_dup(int argc, char **argv) {
   size_t window_size = 5000;
   size_t step_size = 0; /* 0 = auto (window/2) */
   size_t min_bases = 1000;
-  double max_dist = 0.01;
+  double max_dist = 0.02;
   int min_copy = 2;
   int max_copy = 30;
   const char *out_prefix = "reverb";
