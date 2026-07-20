@@ -281,7 +281,7 @@ static void print_usage(void) {
   printf("Reverb: Ultra-fast Alignment-free Segmental Duplication Detection\n\n"
          "Usage: reverb [options] fasta1 [fasta2 ...]\n\n"
          "Options:\n"
-         "  -k: kmer size (default: 21, max: 42)\n"
+         "  -k: kmer size (default: 15, max: 42)\n"
          "  -s: scale factor (default: 10)\n"
          "  -w: window size in bp (default: 1000)\n"
          "  -t: step size in bp (default: window/2)\n"
