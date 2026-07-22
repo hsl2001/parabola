@@ -8,14 +8,6 @@ echo "=================================================="
 echo "1. Environment Activation & Setup"
 echo "=================================================="
 
-if command -v micromamba >/dev/null 2>&1; then
-    eval "$(micromamba shell hook --shell bash)"
-    micromamba activate tree 2>/dev/null || micromamba activate parabola 2>/dev/null || true
-elif command -v conda >/dev/null 2>&1; then
-    eval "$(conda shell.bash hook)"
-    conda activate tree 2>/dev/null || conda activate parabola 2>/dev/null || true
-fi
-
 echo "Python executable: $(which python3 || echo 'Not found')"
 
 if ! command -v biser >/dev/null 2>&1; then
@@ -37,8 +29,8 @@ make
 
 mkdir -p bench_results
 
-YEAST_DIR="/mnt/c/Users/jayli/Downloads/6-yeast-genomes"
-ARAB_DIR="/mnt/c/Users/jayli/Downloads/69-arabidopsis-genomes"
+YEAST_DIR="../6-yeast-genomes"
+ARAB_DIR="../upload_genome/"
 
 SCER_FA="$YEAST_DIR/Saccharomyces_cerevisiae.fasta"
 COL0_FA="$ARAB_DIR/Col-0.fasta"
